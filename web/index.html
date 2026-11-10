@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="branch-desk-build" content="2026.11.09.1"><title>Branch Desk</title><link rel="icon" type="image/svg+xml" sizes="any" href="/favicon.svg"><link rel="stylesheet" href="/style.css"><script defer src="/vendor/vue.global.prod.js"></script><script defer src="/schedule.js"></script><script defer src="/batch.js"></script><script defer src="/app.js"></script></head>
+<body><div id="app" v-cloak>
+  <div ref="messageElement" popover="manual" class="worktree-message" :class="messageType==='error' ? 'danger' : 'success'" :role="messageType==='error' ? 'alert' : 'status'" aria-atomic="true">{{ message }}</div>
+  <dialog ref="confirmationDialog" class="batch-dialog action-confirm-dialog" aria-labelledby="action-confirm-heading" aria-describedby="action-confirm-message" @cancel.prevent="finishConfirmation()" @close="!confirmationDialog.open && finishConfirmation()">
+    <div class="batch-header"><h2 id="action-confirm-heading">{{ confirmation?.title }}</h2></div>
+    <div class="batch-body"><p id="action-confirm-message" class="confirmation-message">{{ confirmation?.message }}</p></div>
+    <div class="batch-footer"><div class="batch-footer-actions"><button autofocus @click="finishConfirmation()">取消</button><button :class="confirmation?.danger ? 'danger-button' : 'primary'" @click="finishConfirmation(true)">{{ confirmation?.confirmLabel }}</button></div></div>
+  </dialog>
+  <dialog ref="serviceDialog" class="batch-dialog release-dialog service-dialog" aria-labelledby="service-heading" @cancel="serviceSubmitting && $event.preventDefault()">
+    <form @submit.prevent="startService">
+      <div class="preview-heading"><div><h2 id="service-heading">{{ isBackendService ? '共用本地后端' : '前端开发服务' }}</h2><p class="hint">{{ serviceTarget?.branch || '工作区' }}</p></div><button type="button" autofocus @click="serviceDialog.close()" :disabled="serviceSubmitting" aria-label="关闭开发服务弹窗">关闭 <kbd>Esc</kbd></button></div>
+      <dl class="release-details service-details"><dt>工作区</dt><dd>{{ serviceTarget?.path }}</dd><dt>状态</dt><dd><span class="service-status" :data-status="currentService.status">{{ serviceSubmitting ? servicePendingLabel : serviceLabel(currentService) }}</span></dd><template v-if="['running','starting'].includes(currentService.status)"><dt>后端环境</dt><dd>{{ serviceBackendLabel(currentService) }}<span v-if="currentService.backend" class="service-backend">{{ currentService.backend }}</span></dd></template><template v-if="currentService.ports.length"><dt>{{ serviceAddressKnown(currentService) ? '访问地址' : '监听端口' }}</dt><dd class="service-ports"><template v-for="port in currentService.ports" :key="port"><button v-if="serviceAddressKnown(currentService)" type="button" class="service-copy-address" @click="copyServiceAddress(port,currentService)" :title="'复制服务地址：'+servicePortUrl(port)">127.0.0.1:{{ port }} · 复制</button><code v-else>:{{ port }}</code><button v-for="url in serviceLanUrls(port,currentService)" :key="url" type="button" class="service-copy-address" @click="copyServiceAddress(port,currentService,url)" :title="'复制局域网地址：'+url">{{ url }} · 复制局域网地址</button></template></dd></template></dl>
+      <div v-if="currentService.processes?.length" class="service-processes"><div v-for="process in currentService.processes" :key="process.pid"><strong>PID {{ process.pid }} · {{ process.ports?.map(port=>':'+port).join('、') || '端口待确认' }}</strong><p v-for="(backend,index) in process.backends || []" :key="index">{{ backend.label }} · {{ backend.backend }}<template v-if="backend.port"> · :{{ backend.port }}</template></p><p v-if="process.backend_error" class="hint">{{ process.backend_error }}</p></div></div>
+      <p v-if="serviceIssue" class="notice danger" role="alert">{{ serviceIssue }}</p>
+      <p v-if="currentService.error && currentService.error!==serviceIssue" class="notice warning" role="status">{{ currentService.error }}</p>
+      <p v-if="servicesWarning && servicesWarning!==currentService.error" class="notice warning" role="status">{{ servicesWarning }}</p>
+      <div v-if="!isBackendService && !['running','starting','stopping'].includes(currentService.status)" class="service-address-field"><label for="service-backend">联调后端地址 <span class="muted">（选填）</span></label><input id="service-backend" v-model="serviceBackendUrl" type="url" maxlength="2048" placeholder="例如 http://127.0.0.1:8185" autocomplete="off" spellcheck="false" :disabled="serviceSubmitting" aria-describedby="service-backend-hint"><p id="service-backend-hint" class="hint">留空使用项目配置；bibase 默认连接本地后端 :8185。填写地址仅本次生效，不会自动启动或切换后端。</p></div>
+      <p v-if="!isBackendService" class="hint">新启动的前端服务支持局域网访问；同一局域网设备可使用上方局域网地址。仅监听本机的已有服务需停止后重新启动。</p>
+      <p v-if="isBackendService" class="notice">多个前端端口共用一份后端。更新代码前先停止后端，更新后再启动；切换项目不会停止服务。启动配置在左侧项目设置中维护。</p>
+      <div v-if="currentService.log_path" class="service-log"><span class="hint">服务日志</span><code>{{ currentService.log_path }}</code><button type="button" @click="copyServiceLog">复制日志路径</button></div>
+      <div class="page-actions"><button type="button" @click="refreshServices" :disabled="servicesLoading || serviceSubmitting">{{ servicesLoading ? '检查中…' : '重新检查状态' }}</button><button v-if="['running','starting'].includes(currentService.status)" type="button" class="danger-button" @click="stopService(serviceTarget)" :disabled="!canStopService(serviceTarget)">停止</button><button v-if="!['running','starting','stopping'].includes(currentService.status)" type="submit" class="primary" :disabled="!canStartService(serviceTarget)" :title="serviceBackendUrl.trim() ? '使用填写的后端地址启动，仅本次生效' : '使用项目服务配置启动'">启动</button></div>
+    </form>
+  </dialog>
+  <dialog ref="historyDialog" id="operation-history" class="batch-dialog history-dialog" aria-labelledby="history-heading" @close="historyClosed">
+    <div class="preview-heading"><div><h2 id="history-heading">操作记录</h2><p class="hint">本机保存 · 最近 200 条</p></div><div class="history-actions"><button @click="loadHistory" :disabled="historyBusy">{{ historyBusy ? '读取中…' : '刷新记录' }}</button><button autofocus @click="historyDialog.close()">关闭 <kbd>Esc</kbd></button></div></div>
+    <div class="history-filters">
+      <label class="sr-only" for="history-search">搜索分支、来源、目录或提交说明</label><input id="history-search" type="search" v-model="historySearch" placeholder="搜索分支、来源、目录或提交说明…">
+      <fieldset class="branch-filters history-type-filter"><legend class="sr-only">操作类型</legend>
+        <label><input class="sr-only" type="radio" name="history-type" value="all" v-model="historyType"><span>全部操作</span></label>
+        <label><input class="sr-only" type="radio" name="history-type" value="merge" v-model="historyType"><span>合并</span></label>
+        <label><input class="sr-only" type="radio" name="history-type" value="commit" v-model="historyType"><span>本地提交</span></label>
+        <label><input class="sr-only" type="radio" name="history-type" value="push" v-model="historyType"><span>推送</span></label>
+      </fieldset>
+      <label class="history-issues"><input type="checkbox" v-model="historyOnlyIssues">仅异常</label>
+      <span class="hint" role="status">{{ filteredHistoryItems.length }} / {{ historyItems.length }} 条</span><button v-if="historySearch || historyType!=='all' || historyOnlyIssues" @click="resetHistoryFilters">清除筛选</button>
+    </div>
+    <div class="history-content" :aria-busy="historyBusy" tabindex="0" role="region" aria-label="操作记录列表">
+      <p class="hint">历史结果仅供回看，当前状态以重新读取的 Git 为准。服务重启不会重放任务。</p>
+      <p v-if="historyBusy" class="loading" role="status">正在读取操作记录…</p>
+      <p v-if="historyWarning" class="history-warning" role="status">{{ historyWarning }}</p>
+      <p v-if="historyError" class="history-warning" role="alert">{{ historyError }}</p>
+      <p v-if="!historyBusy && !historyError && !historyItems.length" class="hint">还没有操作记录。此版本开始记录单次及批量执行的合并、提交和推送。</p>
+      <p v-if="historyItems.length && !filteredHistoryItems.length" class="hint" role="status">没有匹配的操作记录，试试其他关键词或清除筛选。</p>
+      <ol v-if="filteredHistoryItems.length" class="history-list" aria-label="最近执行的 Git 操作"><li v-for="item in filteredHistoryItems" :key="item.id">
+        <div class="history-row"><strong>{{ operationName(item) }} <template v-if="item.source">{{ item.source.replace(/^refs\/(heads|remotes)\//, '') }} → </template>{{ item.branch }}</strong><time>{{ historyTime(item) }}<template v-if="item.finished"> · {{ Math.max(0, Math.round(item.finished-item.started)) }} 秒</template></time></div>
+        <p :class="['unconfirmed','interrupted','failed','conflicts'].includes(item.status) ? 'history-warning' : 'hint'">{{ historyStatus(item) }}</p>
+        <p v-if="item.message" class="history-message">{{ item.operation==='push' ? '结果 HEAD 提交说明：' : '提交说明：' }}{{ item.message.split('\n')[0] }}</p>
+        <p class="history-meta">{{ item.path }}<br><span v-if="item.sha">结果 HEAD {{ item.sha.slice(0,12) }}</span><span v-else>操作前 HEAD {{ item.before_sha.slice(0,12) }}</span><span v-if="item.source_sha"> · 来源 {{ item.source_sha.slice(0,12) }}</span></p>
+        <details v-if="item.message?.includes('\n') || item.message_warning || item.detail || item.resolution_status || item.thread_url" class="history-detail"><summary>查看完整说明与处理详情</summary><p v-if="item.message?.includes('\n')" class="history-message">{{ item.message }}</p><p v-if="item.message_warning" class="history-warning">{{ item.message_warning }}</p><p v-if="item.detail" class="hint">{{ item.detail }}</p><p v-if="item.resolution_status" class="hint">{{ resolutionLabel(item) }}</p><p v-if="item.resolution_detail" class="hint">{{ item.resolution_detail }}</p><a v-if="item.thread_url && item.resolution_status!=='running'" :href="item.thread_url">打开本次 Codex 冲突会话 ↗</a></details>
+      </li></ol>
+    </div>
+  </dialog>
+  <dialog ref="quickDialog" class="batch-dialog quick-dialog" aria-labelledby="quick-heading" @keydown="quickKeydown" @close="quickClosed">
+    <div class="preview-heading"><h2 id="quick-heading">{{ quickMode==='search' ? '快捷入口' : '待处理事项' }}</h2><button @click="closeQuick">关闭 <kbd>Esc</kbd></button></div>
+    <p class="hint" v-if="quickMode==='search'">搜索分支、已加载的排期任务和本机保存的开发会话。来源引用使用本地缓存。</p>
+    <p class="hint" v-else>只读检查冲突、待提交合并和失效关联；点击后重新读取现场，写操作仍须原流程确认。</p>
+    <label for="quick-search">{{ quickMode==='search' ? '搜索名称、编号或目录' : '筛选待处理事项' }}</label>
+    <input ref="quickInput" id="quick-search" type="search" v-model="quickSearch" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="quick-options" :aria-activedescendant="visibleQuickItems[quickActive] ? 'quick-option-'+quickActive : undefined" placeholder="输入分支名或需求编号…" autofocus>
+    <p v-if="quickBusy || quickMode==='attention' && attentionBusy" class="loading" role="status">{{ quickMode==='attention' && attentionBusy ? '正在检查 '+attentionProgress : '正在读取，请稍候…' }}</p>
+    <p v-if="quickError" class="notice warning" role="alert">{{ quickError }}</p>
+    <p v-if="quickMode==='attention' && attentionError" class="notice warning" role="alert">{{ attentionError }}</p>
+    <p v-if="quickMode==='attention' && attentionChecked" class="hint">上次检查 {{ attentionChecked }}<span v-if="attentionStale"> · 结果可能已变化，请重新检查</span></p>
+    <ul id="quick-options" class="quick-options" role="listbox" :aria-label="quickMode==='search' ? '快捷搜索结果' : '待处理事项列表'" :aria-busy="quickBusy || quickMode==='attention' && attentionBusy">
+      <li v-for="(item,index) in visibleQuickItems" :id="'quick-option-'+index" :key="item.key" role="option" :aria-selected="quickActive===index" :aria-disabled="navigationLocked || quickBusy || quickMode==='attention' && attentionBusy" :class="{active:quickActive===index}" @pointerdown.prevent @click="chooseQuick(item)" @mouseenter="quickActive=index">
+        <span class="quick-kind" :class="item.tone">{{ quickMode==='attention' ? '待处理' : ({module:'页面',branch:'分支',task:'需求',session:'会话'})[item.type] }}</span><span class="quick-label"><strong>{{ item.title }}</strong><small>{{ item.detail }}</small></span><span aria-hidden="true">↵</span>
+      </li>
+    </ul>
+    <p v-if="!quickBusy && !(quickMode==='attention' && attentionBusy) && !visibleQuickItems.length" class="hint" role="status">{{ quickSearch ? '没有匹配的结果，试试其他关键词。' : quickMode==='attention' ? (attentionError || attentionStale ? '尚未完成检查，请重试后查看结果。' : '本次检查没有发现这三类待处理事项。') : '暂无可用结果。' }}</p>
+    <div class="quick-footer"><span class="hint">↑↓ 选择 · Enter 打开 · Esc 关闭<span v-if="quickItems.length>60"> · 仅显示前 60 项，请缩小搜索范围</span></span><button v-if="quickMode==='attention'" @click="scanAttention" :disabled="attentionBusy || navigationLocked">重新检查</button><button v-else @click="refreshQuick" :disabled="quickBusy || navigationLocked">刷新结果</button></div>
+  </dialog>
+  <dialog ref="cleanupDialog" class="batch-dialog release-dialog" aria-labelledby="cleanup-heading" @cancel="busy && $event.preventDefault()">
+    <div class="preview-heading"><h2 id="cleanup-heading">工作区清理候选</h2><button autofocus @click="cleanupDialog.close()" :disabled="serviceBusy || busy">关闭</button></div>
+    <p class="hint">初筛排除当前、启动、常用、受保护及有本地改动的工作区。候选仍须逐个检查忽略文件和进程占用，再确认释放。</p>
+    <p v-if="busy" class="loading" role="status">{{ busyLabel }} · {{ cleanupProgress || '准备中' }} · 已用 {{ busySeconds }} 秒</p>
+    <p v-if="error" class="notice danger" role="alert">{{ error }}</p>
+    <p v-if="!busy" class="hint">{{ cleanupRows.length }} 个初步候选 · {{ cleanupSkipped.length }} 个已排除；结果可能随外部操作变化。</p>
+    <ul class="cleanup-list"><li v-for="tree in cleanupRows" :key="tree.path"><span><strong>{{ tree.branch }}</strong><small class="hint wrap">{{ tree.path }}</small></span><button @click="checkCleanup(tree)" :disabled="serviceBusy || busy || batchRunning || resolving">检查释放条件</button></li></ul>
+    <details v-if="cleanupSkipped.length"><summary>查看排除原因</summary><ul class="cleanup-list"><li v-for="tree in cleanupSkipped" :key="tree.path"><span class="wrap">{{ tree.branch || '分离 HEAD' }}<small class="hint">{{ tree.reason }}</small></span></li></ul></details>
+    <button @click="scanCleanup" :disabled="serviceBusy || busy || batchRunning || resolving">重新初筛</button>
+  </dialog>
+  <dialog ref="bulkCleanupDialog" class="batch-dialog release-dialog bulk-cleanup-dialog" aria-labelledby="bulk-cleanup-heading" @cancel.prevent="closeBulkCleanup">
+    <div class="preview-heading"><h2 id="bulk-cleanup-heading">{{ bulkCleanupTitle }}</h2><button type="button" autofocus @click="closeBulkCleanup" :disabled="busy">关闭</button></div>
+    <p class="hint">{{ bulkCleanupMode==='release' ? '只移除工作区目录，保留本地分支、提交及远端。需要保留的忽略文件、未提交改动或进程占用会阻止释放。' : '只删除本地分支，不删除远端。分支仍被 worktree 占用时，请先释放；检查基准以每项预览为准。' }}本批只使用普通安全模式，不强制删除，不自动停止服务。</p>
+    <p v-if="busy" class="loading" role="status">{{ busyLabel }} · 已用 {{ busySeconds }} 秒，请保持页面打开。</p>
+    <p v-if="bulkCleanupIssue" class="notice danger bulk-cleanup-issue" role="alert">{{ bulkCleanupIssue }}</p>
+    <template v-if="!bulkCleanupPreview && !bulkCleanupResults.length">
+      <label class="sr-only" for="bulk-cleanup-search">搜索本地分支或目录</label><input id="bulk-cleanup-search" type="search" v-model="bulkCleanupSearch" placeholder="搜索分支、编号或目录…" :disabled="busy">
+      <div class="bulk-cleanup-tools"><span class="hint" role="status">已选 {{ bulkCleanupSelected.length }} / 30 项 · 当前 {{ bulkCleanupEligible.length }} 项可检查</span><button type="button" @click="selectAllBulkCleanup" :disabled="navigationLocked || !bulkCleanupEligible.length">仅选当前结果</button><button type="button" @click="bulkCleanupSelected=[]" :disabled="navigationLocked || !bulkCleanupSelected.length">清空选择</button></div>
+      <ul class="cleanup-list bulk-cleanup-list" aria-label="待清理的本地分支"><li v-for="row in bulkCleanupVisible" :key="row.ref"><label><input type="checkbox" :value="row.ref" v-model="bulkCleanupSelected" :disabled="navigationLocked || !!row.reason || (!bulkCleanupSelected.includes(row.ref) && bulkCleanupSelected.length>=30)"><span><strong>{{ row.branch }}</strong><small v-if="row.path" class="hint wrap">{{ row.path }}</small><small v-if="row.reason" class="hint">{{ row.reason }}</small></span></label></li></ul>
+      <p v-if="!busy && !bulkCleanupVisible.length" class="hint">没有匹配的本地分支。</p>
+      <div class="page-actions"><button type="button" class="primary" @click="previewBulkCleanup" :disabled="navigationLocked || !bulkCleanupSelected.length || bulkCleanupSelected.length>30">预览所选 {{ bulkCleanupSelected.length }} 项</button></div>
+    </template>
+    <template v-if="bulkCleanupPreview">
+      <p class="hint">请核对以下 {{ bulkCleanupPreview.length }} 项；确认后按顺序执行，每项重新校验。失败立即停止，不自动重试或回滚。执行期间请勿使用其他工具修改这些分支或工作区。</p>
+      <ul class="cleanup-list bulk-cleanup-list"><li v-for="row in bulkCleanupPreview" :key="row.ref"><span><strong>{{ row.branch }}</strong><small v-if="row.error" class="bulk-cleanup-issue">未通过：{{ row.error }}</small><template v-else><small class="hint wrap">提交：{{ row.preview.head }}</small><small v-if="bulkCleanupMode==='release'" class="hint wrap">移除目录：{{ row.preview.path }}</small><small v-else class="hint wrap">检查基准：{{ row.preview.base_ref }} · {{ row.preview.base }}</small><small v-if="row.preview.generated?.length" class="hint wrap">同时移除可重建的运行文件：{{ row.preview.generated.join('、') }}</small></template></span><span class="badge">{{ row.error ? '受阻' : '已通过检查' }}</span></li></ul>
+      <div class="page-actions"><button type="button" @click="resetBulkCleanupPreview" :disabled="navigationLocked">返回选择</button><button type="button" class="danger-button" @click="executeBulkCleanup" :disabled="navigationLocked || !bulkCleanupReady">{{ bulkCleanupMode==='release' ? '确认批量释放' : '确认批量删除本地分支' }}（{{ bulkCleanupPreview.length }}）</button></div>
+    </template>
+    <template v-if="bulkCleanupResults.length">
+      <ul class="cleanup-list bulk-cleanup-list" aria-label="批量清理结果" aria-live="polite"><li v-for="row in bulkCleanupResults" :key="row.ref"><span><strong>{{ row.branch }}</strong><small v-if="row.error" class="bulk-cleanup-issue">{{ row.error }}</small><small v-if="row.status==='pending' && !busy" class="hint">前项受阻，本项未执行。</small></span><span class="badge" :class="{'bulk-cleanup-issue':row.status==='failed'}">{{ bulkCleanupStatus(row.status) }}</span></li></ul>
+      <div class="page-actions"><button type="button" @click="openBulkCleanup(bulkCleanupMode)" :disabled="navigationLocked">重新读取并选择</button><button v-if="bulkCleanupMode==='release' && bulkCleanupResults.some(row=>row.status==='succeeded')" type="button" @click="openBulkCleanup('delete',bulkCleanupResults.filter(row=>row.status==='succeeded').map(row=>row.ref))" :disabled="navigationLocked">继续删除已释放的本地分支…</button></div>
+    </template>
+  </dialog>
+  <dialog ref="releaseDialog" class="batch-dialog release-dialog" aria-labelledby="release-heading" @cancel="busy && $event.preventDefault()">
+    <div class="preview-heading"><h2 id="release-heading">释放 worktree</h2><button autofocus @click="releaseDialog.close()" :disabled="serviceBusy || busy">取消</button></div>
+    <p class="muted">移除工作区目录，保留本地分支、全部提交和远端引用。再次选择分支可重新创建。</p>
+    <p v-if="busy" role="status">{{ busyLabel }}，请稍候…</p>
+    <div v-if="releaseIssue" class="notice danger" role="alert">{{ releaseIssue }}</div>
+    <dl v-if="releaseTarget" class="release-details"><dt>保留分支</dt><dd>{{ releaseTarget.branch }}</dd><dt>工作区目录</dt><dd>{{ releaseTarget.path }}</dd><template v-if="releasePreview"><dt>保留提交</dt><dd>{{ releasePreview.head }}</dd></template></dl>
+    <section v-if="releaseIssue && releaseTarget" class="release-help" aria-label="释放受阻后的操作">
+      <p class="hint">先检查并保留本地文件，再决定如何处理。可以复制信息到 Codex 继续对话，或复制目录手动查看；处理完成后重新检查。</p>
+      <div class="page-actions"><button class="primary" @click="copyReleaseInfo('context')" :disabled="serviceBusy || busy">复制排查信息</button><button @click="copyReleaseInfo('path')" :disabled="serviceBusy || busy">复制目录</button><button @click="previewRelease(releaseTarget, releaseForce)" :disabled="serviceBusy || busy || batchRunning || resolving">重新检查</button><button v-if="!releaseForce" class="danger-button" @click="previewRelease(releaseTarget, true)" :disabled="serviceBusy || busy || batchRunning || resolving">强行释放…</button></div>
+      <p v-if="releaseFeedback" class="notice danger" role="alert">{{ releaseFeedback.message }}</p>
+      <details><summary>查看可复制的排查信息</summary><label class="sr-only" for="release-help-text">排查信息</label><textarea id="release-help-text" :value="releaseHelpText" rows="8" readonly spellcheck="false"></textarea></details>
+    </section>
+    <template v-if="releasePreview">
+      <p v-if="releasePreview.generated.length" class="hint">同时移除可重新生成的 Husky 运行文件：{{ releasePreview.generated.join('、') }}。下次准备工作区时会自动初始化。</p>
+      <div v-if="releasePreview.force" class="notice danger" role="alert">强行释放会删除下方忽略文件及工作区目录，不自动备份，删除后无法通过 Git 恢复这些忽略文件。未提交改动、锁定、进程占用与嵌套仓库仍会阻止释放。本地分支、提交及远端保留。
+        <ul><li v-for="item in releasePreview.ignored" :key="item.path">{{ item.path }} · {{ item.kind }} · {{ item.count }} 项</li></ul>
+        <p v-if="!releasePreview.ignored.length">当前没有忽略文件，普通释放即可。</p>
+        <p>目录项包含子目录和文件；符号链接仅移除链接，不删除其指向的目录。请暂停其他工具对该工作区的写入。</p>
+      </div>
+      <p v-else class="notice warning">请先暂停编辑器及其他任务对该目录的写入。工具会在确认时重新检查，不强制删除，不删除分支。</p>
+      <div class="page-actions"><button @click="releaseDialog.close()" :disabled="serviceBusy || busy">保留工作区</button><button :class="releasePreview.force ? 'danger-button' : 'primary'" @click="requestRelease" :disabled="serviceBusy || busy || batchRunning">{{ releasePreview.force ? '继续强行释放…' : '确认释放 worktree' }}</button></div>
+    </template>
+  </dialog>
+  <dialog ref="forceReleaseDialog" class="batch-dialog release-dialog" aria-labelledby="force-release-heading" @cancel="busy && $event.preventDefault()">
+    <div class="preview-heading"><h2 id="force-release-heading">确认强行释放</h2><button autofocus @click="forceReleaseDialog.close()" :disabled="serviceBusy || busy">取消</button></div><p v-if="busy" role="status">{{ busyLabel }}，请稍候…</p>
+    <template v-if="releasePreview?.force">
+      <p class="wrap">分支：<b>{{ releasePreview.branch }}</b><br>将移除整个工作区目录：{{ releasePreview.path }}</p>
+      <div class="notice danger" role="alert">以下本地忽略文件会随目录永久删除，不自动备份，无法通过 Git 恢复。符号链接仅移除链接，不删除链接指向的内容。</div>
+      <ul><li v-for="item in releasePreview.ignored" :key="item.path" class="wrap">{{ item.path }} · {{ item.kind }} · {{ item.count }} 项（包含子目录和文件）</li></ul>
+      <p v-if="!releasePreview.ignored.length" class="hint">当前没有忽略文件，将仅移除工作区目录。</p>
+      <p class="hint">本地分支、已提交内容和远端保留。确认前将重新检查本地文件和占用情况；请先暂停其他工具写入。</p>
+      <div class="page-actions"><button @click="forceReleaseDialog.close()" :disabled="serviceBusy || busy">保留工作区</button><button class="danger-button" @click="releaseWorktree(true)" :disabled="serviceBusy || busy || batchRunning">确认删除本地文件并释放</button></div>
+    </template>
+  </dialog>
+  <dialog ref="branchDeleteDialog" class="batch-dialog release-dialog branch-delete-dialog" aria-labelledby="branch-delete-heading" @cancel="busy && $event.preventDefault()">
+    <div class="preview-heading"><h2 id="branch-delete-heading">{{ branchDeleteForce ? '强制删除本地分支' : '删除本地分支' }}</h2><button autofocus @click="branchDeleteDialog.close()" :disabled="serviceBusy || busy">取消</button></div>
+    <dl class="release-details"><dt>分支</dt><dd class="wrap"><b>{{ branchDeleteTarget?.branch }}</b></dd></dl>
+    <p class="hint">只删除本地分支及其跟踪配置，远端和工作区文件保留。{{ branchDeleteForce ? '强制模式允许放弃未合并提交；master 和 worktree 占用仍会阻止删除。' : '普通删除保留未合并提交；确定不需要时可使用强制删除。' }}</p>
+    <p v-if="busy" role="status">{{ busyLabel }}，请稍候…</p>
+    <div v-if="branchDeleteIssue" class="notice danger" role="alert">{{ branchDeleteIssue }}</div>
+    <div class="page-actions">
+      <button v-if="branchDeleteIssue && branchDeleteTarget?.path" @click="branchDeleteDialog.close(); previewRelease(branchDeleteTarget)" :disabled="serviceBusy || busy || batchRunning || resolving">先释放对应 worktree</button>
+      <button v-if="!branchDeleteForce && branchDeleteTarget?.ref?.startsWith('refs/heads/') && branchDeleteTarget.branch!=='master'" class="danger-button" @click="previewBranchDelete(branchDeleteTarget, true)" :disabled="serviceBusy || busy || batchRunning || resolving">强制删除…</button>
+    </div>
+    <template v-if="branchDeletePreview">
+      <p class="hint wrap">提交：{{ branchDeletePreview.head }}<br>合并检查基准：{{ branchDeletePreview.base_ref || branchDeletePreview.upstream || branchDeletePreview.root_branch || '启动目录 HEAD' }}</p>
+      <template v-if="branchDeletePreview.force"><h3>相对检查基准未合并的 {{ branchDeletePreview.count }} 个提交</h3><pre class="diff" tabindex="0">{{ branchDeletePreview.commits || '没有未合并提交。' }}</pre><p class="hint">最多显示 80 条；按本地引用检查，不自动获取远端更新。</p></template>
+      <p class="notice" :class="branchDeletePreview.force ? 'danger' : 'warning'">{{ branchDeletePreview.force ? '强制删除不自动备份，未推送且无其他引用保留的提交可能丢失。' : '确认后删除本地分支。' }} 操作前请暂停其他工具对该分支的修改。</p>
+      <div class="page-actions"><button @click="branchDeleteDialog.close()" :disabled="serviceBusy || busy">保留分支</button><button class="danger-button" @click="deleteBranch" :disabled="serviceBusy || busy || batchRunning || resolving">{{ branchDeletePreview.force ? '继续强制删除…' : '确认删除本地分支' }}</button></div>
+    </template>
+  </dialog>
+  <dialog ref="projectDialog" class="batch-dialog project-dialog" aria-labelledby="project-heading" @cancel.prevent="closeProjectDialog()">
+    <div class="preview-heading"><div><h2 id="project-heading">项目设置</h2><p class="hint">当前项目设置按本地项目保存。</p></div><button autofocus @click="closeProjectDialog" :disabled="projectBusy">关闭 <kbd>Esc</kbd></button></div>
+    <p v-if="projectError" class="notice danger" role="alert">{{ projectError }}</p><p v-if="feishuWarning" class="notice warning" role="status">{{ feishuWarning }}</p><p v-if="projectConnectStatus" class="notice" role="status">{{ projectConnectStatus }}</p>
+    <section class="project-dialog-section"><h3>本地项目</h3>
+      <label class="project-current-name">当前项目名称<input v-model="projectDisplayName" type="text" maxlength="120" :disabled="projectBusy"></label>
+      <form class="project-add-form" @submit.prevent="addProject">
+        <div class="project-field"><label for="project-path">项目目录</label><div class="project-input-action"><input id="project-path" v-model="projectPath" type="text" maxlength="4096" placeholder="前端或后端 Git 仓库的绝对路径" autocomplete="off"><button type="button" v-if="desktopDirectoryPicker" @click="chooseProjectDirectory" title="选择项目目录">选择目录</button></div></div>
+        <div class="project-field"><label for="project-name">显示名称</label><div class="project-input-action"><input id="project-name" v-model="projectName" type="text" maxlength="120" placeholder="默认使用目录名称"><button type="submit" class="primary" :disabled="projectBusy || !projectPath">添加项目</button></div></div>
+      </form>
+      <ul class="project-list"><li v-for="item in projects" :key="item.id"><span><strong>{{ item.name || item.path }}</strong><small class="hint wrap">{{ item.path }}</small></span><span class="project-row-actions"><span v-if="item.id===defaultProjectId" class="badge">默认</span><button v-else @click="setDefaultProject(item.id)" :disabled="projectBusy || reloadLocked">设为默认</button><button v-if="item.id!==currentProjectId" @click="connectProject(item)" :disabled="projectBusy || reloadLocked || projectSettingsDirty">切换</button><button v-if="item.id!==currentProjectId" class="danger-button" @click="removeProject(item)" :disabled="projectBusy || reloadLocked">移出</button><span v-else class="hint">当前项目</span></span></li></ul>
+    </section>
+    <template v-if="projectForm">
+      <section class="project-dialog-section">
+        <h3>{{ isBackendService ? '共用本地后端' : '前端开发服务' }}</h3>
+        <p v-if="serviceOptions.supported===false" class="hint">当前项目尚不支持一键管理开发服务；Git 功能仍可使用。</p>
+        <div v-else class="project-form-grid">
+          <fieldset class="project-options"><legend>启动脚本</legend><div class="project-options-list"><label v-for="item in serviceOptions.scripts || []" :key="item.name"><input type="radio" name="project-script" :value="item.name" v-model="projectForm.service.script"><span>{{ item.name }}</span></label></div></fieldset>
+          <label>{{ isBackendService ? 'Spring Profile' : '模式' }}<input v-model="projectForm.service.mode" type="text" maxlength="32" placeholder="test"></label>
+          <fieldset v-if="!isBackendService" class="project-options"><legend>端口策略</legend><div class="project-options-list"><label><input type="radio" name="project-port" value="auto" v-model="projectForm.service.port_strategy"><span>自动</span></label><label><input type="radio" name="project-port" value="fixed" v-model="projectForm.service.port_strategy"><span>固定</span></label></div></fieldset>
+          <label v-if="projectForm.service.port_strategy==='fixed'">固定端口<input v-model.number="projectForm.service.port" type="number" min="1024" max="65535" step="1"></label>
+          <template v-if="isBackendService">
+            <label>Java Home（选填）<input v-model="projectForm.service.java_home" type="text" maxlength="4096" placeholder="兼容的 JDK 目录；bimgntserv 使用 Java 8"></label>
+            <label>本地覆盖配置（选填）<input v-model="projectForm.service.config_file" type="text" maxlength="4096" placeholder="properties / yml / yaml 文件的绝对路径"></label>
+          </template>
+          <label v-else-if="serviceOptions.backend_override">默认联调后端<input v-model="projectForm.service.test_backend" type="url" maxlength="2048" placeholder="http://127.0.0.1:8185"></label>
+        </div>
+        <p v-if="isBackendService" class="hint">只运行一份共用后端，固定端口；切换前端项目不会停止它。启动前核对测试依赖、消息消费及定时任务，配置文件保留在本机。</p>
+        <p class="hint">保存设置不会启动、停止或重启服务。</p>
+      </section>
+      <section class="project-dialog-section"><h3>飞书项目</h3><label class="project-enabled"><input v-model="projectForm.feishu.enabled" type="checkbox" @change="projectForm.feishu.enabled && loadProjectMetadata()">启用飞书排期</label>
+        <template v-if="projectForm.feishu.enabled"><div class="project-form-grid project-feishu-grid">
+          <fieldset class="project-options"><legend>项目空间</legend><div class="project-options-list"><label v-for="item in projectMetadata.spaces || []" :key="item.project_key"><input type="radio" name="project-space" :value="item.project_key" v-model="projectForm.feishu.space_id" @change="projectForm.feishu.work_item_type=''; projectForm.feishu.node_name=''; loadProjectMetadata()"><span>{{ item.name }}</span></label></div></fieldset>
+          <p class="hint project-space-link">项目链接：{{ projectMetadata.selected_space?.project_url || projectForm.feishu.project_url || '选择空间后显示' }}</p>
+          <fieldset class="project-options"><legend>需求类型</legend><div class="project-options-list"><label v-for="item in (projectMetadata.types || []).filter(type=>type.is_disable!==1)" :key="item.type_key"><input type="radio" name="project-type" :value="item.type_key" v-model="projectForm.feishu.work_item_type" @change="projectForm.feishu.node_name=''; loadProjectMetadata()"><span>{{ item.name }}</span></label></div></fieldset>
+          <div class="project-field"><label for="project-node-sample">节点样例需求编号</label><div class="project-input-action"><input id="project-node-sample" v-model="projectForm.feishu.sample_work_item_id" inputmode="numeric" maxlength="20" placeholder="读取节点列表所需"><button type="button" @click="loadProjectMetadata">读取节点</button></div></div>
+          <fieldset class="project-options"><legend>本人节点</legend><div class="project-options-list"><label v-for="item in projectMetadata.nodes || []" :key="item.node_key"><input type="radio" name="project-node" :value="item.name" v-model="projectForm.feishu.node_name"><span>{{ item.name }}</span></label></div></fieldset>
+          <fieldset class="project-options"><legend>关联版本字段</legend><div class="project-options-list"><label v-for="item in (projectMetadata.fields || []).filter(field=>field.related_work_item_info?.length)" :key="item.field_key"><input type="radio" name="project-version-field" :value="item.field_key" v-model="projectForm.feishu.version_field" @change="loadProjectMetadata()"><span>{{ item.field_name }}</span></label></div></fieldset>
+          <fieldset class="project-options"><legend>上线日期字段</legend><div class="project-options-list"><label v-for="item in projectMetadata.version_fields || []" :key="item.field_key"><input type="radio" name="project-date-field" :value="item.field_key" v-model="projectForm.feishu.release_date_field"><span>{{ item.field_name }}</span></label></div></fieldset>
+          <fieldset class="project-options"><legend>负责人字段</legend><div class="project-options-list"><label v-for="item in projectMetadata.node_fields || []" :key="item.field_key"><input type="radio" name="project-owner-field" :value="item.field_key" v-model="projectForm.feishu.owner_field"><span>{{ item.field_name }}</span></label></div></fieldset>
+        </div><p v-if="projectMetadataBusy" class="loading" role="status">正在读取飞书项目配置…</p><p v-if="projectMetadataWarning" class="notice warning" role="alert">{{ projectMetadataWarning }}</p></template>
+        <div class="project-save-actions"><button class="primary" @click="saveProjectSettings" :disabled="projectBusy || !projectConfigDirty">保存项目设置</button></div><p class="hint">保存前会由飞书连接验证空间和字段。禁用飞书后，代码管理仍可使用。</p></section>
+    </template>
+    <section class="project-dialog-section"><h3>项目规则</h3><p class="hint">提交：{{ projectRules.commit==='bibase' ? 'bibase M-ID 与提交格式规则' : '项目自身提交规则' }} · 开发流程：{{ projectRules.development || '按当前项目支持情况' }}</p><p v-if="projectRules.sources?.length" class="hint wrap">已发现：{{ projectRules.sources.join('、') }}</p></section>
+    <div class="page-actions"><button @click="closeProjectDialog()" :disabled="projectBusy">取消</button><button v-if="pendingProject && projectConnectStatus?.includes('未运行')" class="primary" @click="connectProject(pendingProject,true)" :disabled="projectBusy || reloadLocked">启动工作台</button></div>
+  </dialog>
+  <div class="shell" :class="{'schedule-view':view==='schedule'}">
+      <aside class="session-tools" aria-label="工作台导航">
+        <header class="workspace-toolbar">
+          <div class="brand"><span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="7" cy="5" r="2"/><circle cx="17" cy="6" r="2"/><circle cx="7" cy="19" r="2"/><path d="M7 7v10m10-9v2a4 4 0 0 1-4 4H7"/></svg></span><div><strong>Branch Desk</strong><small>本地开发工作台</small></div></div>
+          <div class="project-controls"><details class="project-switcher"><summary :title="projects.find(item=>item.id===currentProjectId)?.path"><span>{{ projects.find(item=>item.id===currentProjectId)?.name || '选择项目' }}</span><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m8 10 4 4 4-4"/></svg></summary><div class="project-switch-menu" role="group" aria-label="切换工作台项目"><button v-for="item in projects" :key="item.id" @click="connectProject(item)" :disabled="projectBusy || reloadLocked || projectSettingsDirty" :aria-current="item.id===currentProjectId ? 'true' : undefined"><strong>{{ item.name || item.path }}</strong><small>{{ item.path }}</small></button><button type="button" @click="$event.currentTarget.closest('details').open=false; openProjectDialog()" :disabled="projectBusy || reloadLocked"><strong>添加项目…</strong><small>连接前端或后端仓库</small></button></div></details><button type="button" class="project-settings-button" @click="openProjectDialog" :disabled="projectBusy || reloadLocked" title="项目设置" aria-label="项目设置"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68h.08A1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9v.08A1.65 1.65 0 0 0 20.83 10H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15Z"/></svg></button></div>
+          <nav class="module-nav" aria-label="工具模块"><button type="button" title="代码合并" aria-label="分支管理 · 代码合并" :aria-pressed="view==='merge'" aria-controls="merge-workspace" @click="switchView('merge')" :disabled="serviceBusy || busy"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="5" r="2"/><circle cx="17" cy="6" r="2"/><circle cx="7" cy="19" r="2"/><path d="M7 7v10m10-9v2a4 4 0 0 1-4 4H7"/></svg><span>分支管理</span></button><button v-if="feishuEnabled" type="button" title="我的排期" aria-label="我的排期" :aria-pressed="view==='schedule'" aria-controls="schedule-workspace" @click="switchView('schedule')" :disabled="serviceBusy || busy"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="5" width="16" height="16" rx="3"/><path d="M8 3v4m8-4v4M4 11h16m-11 4h2m2 0h2"/></svg><span>我的排期</span></button></nav>
+        <div class="workspace-shortcuts"><button @click="openQuick('search')" :disabled="navigationLocked || !overview.root" aria-keyshortcuts="Meta+K Control+K" :title="scheduleLocked ? '请先完成或取消排期读取和编辑' : '搜索分支、需求与开发会话'"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg>快捷入口 <kbd title="macOS：⌘K；Windows / Linux：Ctrl K">⌘K</kbd></button><button @click="openQuick('attention')" :disabled="navigationLocked || !overview.root" :class="{ 'attention-needed': attentionItems.length }" :title="scheduleLocked ? '请先完成或取消排期读取和编辑' : '查看冲突、待提交合并和失效关联'"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v6m0 3v.1"/></svg>待处理<span v-if="attentionItems.length" class="badge">{{ attentionItems.length }}</span><small v-if="attentionBusy">检查中…</small><small v-else-if="attentionError || attentionStale">待检查</small></button>
+          <button @click="openHistory" :disabled="!overview.root" aria-haspopup="dialog" aria-controls="operation-history" :aria-expanded="historyOpen" title="查看本机保存的最近 200 条操作记录"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11a9 9 0 1 1 2.6 7.4M3 4v7h7m2-4v5l3 2"/></svg>操作记录</button>
+        </div>
+        </header>
+        <div class="sidebar-version"><span v-if="pageBuild" class="build-label" :title="'当前页面版本：'+pageBuild">v{{ pageBuild }}</span><button v-if="availableBuild" class="version-update" @click="reloadWorkbench" :disabled="reloadLocked" :title="reloadLocked ? '请先完成当前操作并保存或取消编辑，再刷新页面' : '刷新整个页面以使用新版本'">发现新版 · 刷新页面</button></div>
+        <div v-if="resume" class="resume-bar"><span>上次停在 <strong>{{ resume.branch || (resume.view==='schedule' ? '我的排期' : '代码合并') }}</strong></span><div><button @click="restoreWorkspace" :disabled="navigationLocked">继续上次工作</button><button @click="dismissResume" :disabled="serviceBusy || busy" aria-label="忽略上次工作选择" title="忽略上次选择">×</button></div></div>
+        <p v-if="workspaceNotice" class="resume-feedback" role="status">{{ workspaceNotice }} <button @click="workspaceNotice=''" aria-label="关闭恢复提示">×</button></p>
+        <p v-if="storageWarning" class="hint" role="status">{{ storageWarning }}</p>
+        <p v-if="historyWarning" class="history-warning" role="status">{{ historyWarning }}</p>
+        <details v-if="error" class="workspace-details"><summary>最近错误详情</summary><pre class="status-output">{{ error }}</pre></details>
+      </aside>
+        <div class="module-pages">
+      <keep-alive :max="1"><schedule-panel :key="overview.root+':'+projectSettings.feishu?.space_id" ref="schedulePanel" :workspace-key="overview.root" :space-id="projectSettings.feishu?.space_id || ''" :legacy-space-id="projectSettings.feishu?.legacy_space_id || ''" :node-name="projectSettings.feishu?.node_name || '前端开发'" @dirty="scheduleDirty=$event" id="schedule-workspace" tabindex="0" v-if="view==='schedule' && feishuEnabled" :api="api" :confirm-action="confirmAction" :locked="serviceBusy || busy || batchRunning || resolving" :focus-task="scheduleFocus" :merge-release="mergeRelease" :show-message="showMessage" @loaded="scheduleTasks=$event" @locked="scheduleLocked=$event" @open-branch="openTaskBranch"></schedule-panel></keep-alive>
+    <main id="merge-workspace" v-show="view==='merge'">
+      <div class="title-row branch-workspace-title"><div><div class="workspace-title-line"><h1>{{ mergePane==='overview' ? '分支总览' : '合并审查' }}</h1><span v-if="mergePane==='overview'" class="branch-count" role="status">{{ filteredTrees.length }} 个分支</span></div><p class="muted repo-path" :title="overview.root">{{ overview.root || '正在读取仓库…' }}</p></div><div class="page-actions" role="group" aria-label="代码合并操作">
+        <batch-dialog ref="batchDialog" :show-message="showMessage" :api="api" :confirm-action="confirmAction" :overview="overview" :selected-path="path" :disabled="serviceBusy || busy || resolving" @locked="batchRunning=$event" @changed="batchFinished"></batch-dialog>
+        <button id="workspace-batch-menu-trigger" type="button" popovertarget="workspace-batch-menu" class="primary">批量操作<span v-if="batchDialog?.running" class="toolbar-running" role="status">执行中</span><svg class="dropdown-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
+        <div id="workspace-batch-menu" popover="auto" class="source-menu workspace-action-popover" role="group" aria-label="批量操作" @beforetoggle="positionToolbarMenu" @click.capture="$event.target.closest('button:not(:disabled)') && $event.currentTarget.hidePopover()">
+          <button type="button" @click="batchDialog.open('all-in')" :disabled="serviceBusy || busy || resolving || !batchDialog">批量合并</button>
+          <button type="button" @click="batchDialog.open('sync')" :disabled="serviceBusy || busy || resolving || !batchDialog">批量同步</button>
+          <button v-if="batchDialog?.job" type="button" @click="batchDialog.showJob()">{{ batchDialog.running ? '查看执行进度…' : (batchDialog.job.push?.status || batchDialog.job.status)==='succeeded' ? '批量完成 · 查看结果' : '查看批量结果' }}</button>
+          <hr>
+          <button type="button" @click="openBulkCleanup('release')" :disabled="navigationLocked">批量释放 WT</button>
+          <button type="button" class="toolbar-danger" @click="openBulkCleanup('delete')" :disabled="navigationLocked">批量删除分支</button>
+        </div>
+        <button id="workspace-more-menu-trigger" type="button" popovertarget="workspace-more-menu">更多操作<svg class="dropdown-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
+        <div id="workspace-more-menu" popover="auto" class="source-menu workspace-action-popover" role="group" aria-label="更多操作" @beforetoggle="positionToolbarMenu" @click.capture="$event.target.closest('button:not(:disabled)') && $event.currentTarget.hidePopover()">
+          <button type="button" @click="scanCleanup" :disabled="serviceBusy || busy || batchRunning || resolving" title="只读初筛，释放前仍需逐个检查确认">清理候选</button>
+          <button type="button" @click="fetchRemote" :disabled="serviceBusy || busy || batchRunning || resolving" title="从 origin 获取最新引用，不修改工作区">刷新远端引用</button>
+        </div>
+        <button type="button" @click="refresh" :disabled="serviceBusy || busy || batchRunning">刷新列表</button>
+      </div></div>
+      <div v-if="activeTask || busy || mergePane==='review' && lastAction || mergePane==='overview' && resultTitle" class="branch-workspace-feedback">
+      <div v-if="activeTask" class="task-context"><span class="wrap">当前需求：<strong>{{ activeTask.title }}</strong> · {{ activeTask.work_item_id }}</span><div><a v-if="activeTask.url" :href="activeTask.url">打开开发会话 ↗</a><button @click="switchView('schedule')" :disabled="serviceBusy || busy">返回排期</button></div></div>
+      <p v-if="busy" class="loading" role="status">{{ busyLabel }}，已用 {{ busySeconds }} 秒…</p>
+      <p v-else-if="mergePane==='review' && lastAction" class="last-action" role="status">最近操作：{{ lastAction.label }} · 用时 {{ lastAction.seconds }} 秒</p>
+        <p v-if="mergePane==='overview' && resultTitle" class="notice branch-result-summary" role="status"><strong>{{ resultTitle }}</strong><span>{{ resultDescription }}</span></p>
+      </div>
+        <div v-show="mergePane==='overview'" class="branch-overview-tools">
+          <div class="branch-search"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><label class="sr-only" for="worktree-search">搜索分支、编号或路径</label><input id="worktree-search" v-model="search" type="search" placeholder="搜索分支、编号或路径…" :disabled="serviceBusy || busy || batchRunning"></div>
+
+          <div class="branch-sort"><span aria-hidden="true">排序</span><fieldset class="branch-filters branch-sort-options" :disabled="serviceBusy || busy || batchRunning"><legend class="sr-only">分支排序</legend><label><input class="sr-only" type="radio" name="branch-sort" value="default" v-model="branchSort"><span>默认顺序</span></label><label><input class="sr-only" type="radio" name="branch-sort" value="name" v-model="branchSort"><span>分支名称</span></label></fieldset></div>
+          <fieldset class="branch-filters branch-overview-filters" :disabled="serviceBusy || busy || batchRunning"><legend class="sr-only">筛选分支</legend><label v-for="filter in branchFilters" :key="filter.value"><input class="sr-only" type="radio" name="branch-filter" :value="filter.value" v-model="treeFilter"><span>{{ filter.label }}</span></label></fieldset>
+        </div>
+        <p v-if="servicesWarning && mergePane==='overview'" class="notice warning branch-status-warning" role="status">{{ servicesWarning }}</p>
+
+      <section id="branch-overview" ref="overviewPane" v-show="mergePane==='overview'" class="branch-overview" tabindex="0" aria-label="分支总览">
+        <div class="branch-table-frame">
+          <table class="branch-overview-table" role="table" aria-label="分支、工作区与开发服务">
+            <colgroup><col class="branch-expand-col"><col class="branch-name-col"><col class="branch-workspace-col"><col class="branch-service-col"><col class="branch-environment-col"><col class="branch-actions-col"></colgroup>
+            <thead role="rowgroup"><tr role="row"><th scope="col" class="branch-expand-cell"><span class="sr-only">详情与操作</span></th><th scope="col">分支 / 需求</th><th scope="col">工作区</th><th scope="col">服务 / 端口</th><th scope="col">环境</th><th scope="col" class="branch-actions-heading">操作</th></tr></thead>
+            <tbody v-for="group in orderedBranchGroups" :key="group.label" v-show="group.trees.length" role="rowgroup" :aria-label="group.label">
+              <tr class="branch-group-row" role="row"><th colspan="6" scope="rowgroup"><span>{{ group.label }}</span><span class="branch-group-count">{{ group.trees.length }}</span></th></tr>
+              <template v-for="w in group.trees" :key="treeKey(w)">
+                <tr class="branch-summary-row" :class="{selected:!!path && path===w.path, expanded:expandedBranch===treeKey(w)}" role="row">
+                  <td class="branch-expand-cell" role="cell"><button :id="branchDetailsId(w)+'-toggle'" class="branch-expand-button" @click="toggleBranchDetails(w)" @keydown.esc.stop="closeBranchDetails()" :aria-expanded="expandedBranch===treeKey(w)" :aria-controls="branchDetailsId(w)" :aria-label="(expandedBranch===treeKey(w) ? '收起分支详情与操作：' : '展开分支详情与操作：')+(w.name || w.branch || '分离 HEAD')"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m9 6 6 6-6 6"/></svg></button></td>
+                  <th scope="row" class="branch-name-cell" role="rowheader"><div class="branch-name-heading"><strong class="branch-table-name" :title="w.name || w.branch || '分离 HEAD'">{{ branchName(w) }}</strong><button v-if="w.branch" type="button" class="branch-copy" :aria-label="'复制分支名称：'+w.branch" title="复制分支名称" @click.stop="copyBranch(w.branch)"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2h3"/></svg></button></div><span v-if="branchNumber(w)" class="branch-table-number">{{ branchNumber(w) }}</span><span class="branch-row-tags"><span v-if="isPinned(w)" class="badge">常用</span><span v-if="w.branch==='master'" class="badge branch-protected" title="允许合并和本地提交；禁止推送、删除和释放 master">推送受限</span><span v-else-if="path && path===w.path" class="badge branch-current">当前审查</span><span v-if="w.remote" class="badge">远端</span><span v-if="branchSyncTag(w)" class="badge" :class="'branch-sync-'+branchSyncTag(w).tone" :title="branchSyncTag(w).title">{{ branchSyncTag(w).label }}</span></span></th>
+                  <td class="branch-workspace-cell" data-label="工作区" role="cell"><span class="branch-workspace-state" :class="'tone-'+branchWorkspace(w).tone">{{ branchWorkspace(w).label }}</span></td>
+                  <td class="branch-service-cell" data-label="服务 / 端口" role="cell"><template v-if="w.path && !w.missing"><span class="service-status" :data-status="serviceFor(w).status">{{ serviceLabel(serviceFor(w)) }}</span><div v-if="serviceFor(w).ports.length" class="branch-table-ports"><template v-for="port in serviceFor(w).ports" :key="port"><button v-if="serviceAddressKnown(serviceFor(w))" class="service-copy-address" @click="copyServiceAddress(port,serviceFor(w))" :title="'复制服务地址：'+servicePortUrl(port)" :aria-label="'复制 '+w.branch+' 服务地址，端口 '+port">:{{ port }} · 复制</button><span v-else class="service-port-number">:{{ port }}</span><button v-for="(url,index) in serviceLanUrls(port,serviceFor(w))" :key="url" type="button" class="service-copy-address" @click="copyServiceAddress(port,serviceFor(w),url)" :title="'复制局域网地址：'+url" :aria-label="'复制 '+w.branch+' 局域网地址：'+url">局域网{{ serviceLanUrls(port,serviceFor(w)).length > 1 ? index+1 : '' }}</button></template></div></template><span v-else class="branch-cell-muted">{{ w.missing ? '目录缺失' : '尚无工作区' }}</span></td>
+                  <td class="branch-environment-cell" data-label="环境" role="cell"><span class="branch-cell-muted">{{ w.path && !w.missing && ['running','starting','stopping'].includes(serviceFor(w).status) ? serviceBackendLabel(serviceFor(w)) : '—' }}</span></td>
+                  <td class="branch-actions-cell" data-label="操作" role="cell"><div class="branch-row-actions"><template v-if="w.path && !w.missing"><button v-if="w.branch" @click="openBranchConversation(w)" :disabled="navigationLocked" :aria-label="'在 Codex 中为 '+w.branch+' 新建对话'" title="打开 Codex 新对话并预填调整提示">对话</button><button v-if="['stopped','failed'].includes(serviceFor(w).status)" @click="openService(w,true)" :disabled="!canStartService(w)" :aria-label="'为 '+w.branch+' 启动服务，默认测试环境'" title="使用项目配置的测试环境启动">启动</button><button v-else-if="['running','starting'].includes(serviceFor(w).status)" class="service-stop-button" @click="stopService(w)" :disabled="!canStopService(w)" :aria-label="'停止 '+w.branch+' 的前端服务'">停止</button><button v-else-if="serviceFor(w).status==='stopping'" disabled>停止中</button><button v-else @click="refreshServices" :disabled="servicesLoading || serviceSubmitting">{{ servicesLoading ? '检查中…' : '检查状态' }}</button></template><button :id="branchDetailsId(w)+'-review'" class="branch-enter-review" @click="enterReview(w)" :disabled="navigationLocked || w.missing || !w.branch" :title="!w.branch ? '分离 HEAD，无法作为合并目标' : w.path ? '打开此分支的合并审查' : '确认创建工作区后进入合并审查'">进入合并</button></div></td>
+                </tr>
+                <tr v-show="expandedBranch===treeKey(w)" class="branch-details-row" role="row"><td colspan="6" role="cell"><section :id="branchDetailsId(w)" class="branch-inline-details" role="region" :aria-label="(w.name || w.branch || '分离 HEAD')+' 详情与操作'" @keydown.esc.stop="closeBranchDetails()">
+                  <dl><dt>完整分支</dt><dd><span>{{ w.name || w.branch || '分离 HEAD' }}</span></dd><dt>工作区目录</dt><dd><span>{{ w.path || '尚未创建；进入合并时会先确认创建工作区。' }}</span><button v-if="w.path" @click="copyPath(w.path)" class="branch-detail-copy">复制目录</button></dd><template v-if="w.path && !w.missing"><dt>后端环境</dt><dd><span>{{ serviceBackendLabel(serviceFor(w)) }}<template v-if="serviceFor(w).backend"> · {{ serviceFor(w).backend }}</template></span><button @click="openService(w)" :disabled="serviceSubmitting || busy || batchRunning || resolving || scheduleLocked">设置联调地址</button></dd><template v-if="serviceFor(w).pids?.length"><dt>进程 PID</dt><dd>{{ serviceFor(w).pids.join('、') }}</dd></template><template v-if="serviceFor(w).log_path"><dt>服务日志</dt><dd><code>{{ serviceFor(w).log_path }}</code></dd></template></template></dl>
+                  <p v-if="w.path && !w.missing && serviceFor(w).error" class="notice warning" role="status">{{ serviceFor(w).error }}</p>
+                  <div class="branch-detail-actions" role="group" aria-label="分支操作"><button v-if="w.branch" @click="updateBranch(w)" :disabled="!canUpdateBranch(w)" :title="!w.path || w.missing ? '请先准备可用工作区' : '从 origin 同名分支拉取最新提交，仅快进更新；请先完成或取消其他操作预览'">更新</button><button v-if="w.branch" @click="pinBranch(w)" :disabled="preferencesSaving || !preferencesLoaded">{{ isPinned(w) ? '从常用移除' : '设为常用目标' }}</button></div>
+                  <div class="branch-management"><button v-if="w.path && w.path!==overview.root && w.branch && w.branch!=='master' && !w.missing" class="release-button" :aria-label="'释放 '+w.branch+' 的 worktree'" :disabled="serviceBusy || busy || batchRunning || resolving" @click="previewRelease(w)">释放 worktree</button><button v-if="w.ref && w.ref.startsWith('refs/heads/') && w.branch!=='master'" class="delete-branch-button" :aria-label="'删除本地分支：'+w.branch" :disabled="serviceBusy || busy || batchRunning || resolving" @click="previewBranchDelete(w)">删除本地分支</button></div>
+                </section></td></tr>
+              </template>
+            </tbody>
+          </table>
+          <p v-if="!filteredTrees.length" class="branch-overview-empty" role="status">{{ busy && !overview.root ? '正在读取分支…' : treeFilter==='recent' ? '还没有最近使用的分支。进入合并后会记录在这里。' : '没有匹配的分支，试试其他关键词或筛选条件。' }}</p>
+        </div>
+        </section>
+      <footer v-show="mergePane==='overview'" class="branch-overview-footnote"><span>{{ isBackendService ? '共用后端 · 停止 → 更新同名需求分支 → 启动 · 前端端口统一连接此服务' : '已有工作区直接复用 · 多个前端默认共用本地后端 · 端口自动分配' }}</span><span v-if="lastAction" class="last-action" role="status">最近操作：{{ lastAction.label }} · 用时 {{ lastAction.seconds }} 秒</span></footer>
+      <section id="merge-review" class="merge-review" v-show="mergePane==='review'" tabindex="-1" aria-label="合并审查">
+        <div class="merge-review-navigation"><button @click="returnToOverview()" :disabled="navigationLocked"><span aria-hidden="true">←</span> 返回分支总览</button><span v-if="state?.branch">当前接收分支：<strong>{{ state.branch }}</strong></span></div>
+        <div class="merge-content" tabindex="0" aria-label="代码合并与差异审查内容">
+      <div class="workflow-summary"><p>{{ nextStep }}</p><span>单次合并后待提交 · 推送单独确认</span></div>
+      <section v-if="!state" class="empty"><span class="empty-symbol" aria-hidden="true">⑂</span><h2>从一个工作区开始</h2><p>选择接收代码的分支，查看差异，再确认合并。</p><ol class="merge-steps"><li><span>01</span>选择目标</li><li><span>02</span>搜索来源</li><li><span>03</span>预览并合并</li></ol><p class="empty-footnote">合并后停在待提交状态，由你检查并提交。</p></section>
+      <template v-else>
+        <section class="panel destination" aria-label="合并方向与工作区状态">
+          <div class="workspace-heading"><span class="panel-label">单次合并</span><span class="state-pill" :class="'state-'+workspaceStatus.tone">{{ workspaceStatus.label }}</span></div>
+          <div class="direction-grid">
+            <div class="direction-source"><label for="source-select">来源分支</label>
+            <div class="source-select">
+              <input id="source-select" role="combobox" autocomplete="off" aria-autocomplete="list" aria-controls="source-options" :aria-expanded="sourceOpen" :aria-activedescendant="sourceActiveId" :value="sourceOpen ? sourceSearch : sourceName" :placeholder="sourceOpen && sourceName ? sourceName : '请选择或搜索本地 / 远端分支…'" :disabled="serviceBusy || busy || batchRunning || resolving" @focus="openSource" @click="openSource" @input="filterSource($event.target.value)" @keydown="sourceKeydown" @blur="closeSource">
+              <span class="source-caret" aria-hidden="true">⌄</span>
+              <div v-if="sourceOpen" ref="sourceMenu" class="source-menu" popover="manual">
+                <div id="source-options" role="listbox" aria-label="来源分支">
+                  <template v-for="group in sourceGroups" :key="group.label">
+                    <div v-if="group.refs.length" role="group" :aria-label="group.label">
+                      <div class="source-group-title" aria-hidden="true">{{ group.label }}</div>
+                      <div v-for="r in group.refs" :id="'source-option-' + sourceOptions.indexOf(r)" :key="r.ref" role="option" :aria-selected="source===r.ref" class="source-option" :class="{active:sourceOptions[sourceActive]===r, chosen:source===r.ref}" @pointerdown.prevent @click="chooseSource(r)" @mouseenter="sourceActive=sourceOptions.indexOf(r)"><span>{{ r.name }}</span><span v-if="source===r.ref" aria-hidden="true">✓</span></div>
+                    </div>
+                  </template>
+                </div>
+                <div v-if="!sourceOptions.length" class="source-empty" role="status">没有匹配的分支</div>
+              </div>
+            </div>
+            </div><span class="direction-arrow" aria-hidden="true">→</span>
+            <div class="direction-target"><span class="field-label">接收分支</span><div class="target-title"><strong>{{ state.branch || '分离 HEAD' }}</strong><button v-if="state.branch" class="branch-copy" :aria-label="'复制分支名称：'+state.branch" title="复制分支名称" @click="copyBranch(state.branch)"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2h3"/></svg></button><span class="badge">{{ state.head.slice(0,10) }}</span></div></div>
+          </div>
+          <div class="merge-toolbar">
+            <div class="merge-utilities"><span class="hint">{{ fetchedAt ? '上次刷新 '+fetchedAt : '引用为本地缓存' }}</span></div>
+
+          </div>
+          <p class="hint workflow-note">{{ pushedHere ? '本次推送已回读核验；远端后续变化需重新核对。' : '合并 → 本地提交 → 远端推送，每一步分别预览确认。' }}</p>
+          <p v-if="mergeReason && !plan && !commitPreview && !pushPreview && !resolutionPreview && !busy" class="hint action-reason">预览不可用：{{ mergeReason }}</p>
+          <div v-if="state.blocked" class="notice warning">{{ canCommit ? '合并待提交，请先检查暂存内容。' : canCommitCurrent ? '当前分支有未提交改动，可使用底部“提交当前分支”选择文件并提交。' : state.blocked }}</div>
+          <div v-if="canReviewResolution && !resolutionPreview" class="page-actions"><button class="primary" @click="previewResolution" :disabled="serviceBusy || busy" aria-controls="resolution-review-panel" :aria-expanded="!!resolutionPreview">检查修复结果</button><span class="hint">已修复内容仍显示为冲突时，先只读检查差异，再确认暂存。</span></div>
+          <details class="workspace-details"><summary>工作区详情</summary><dl class="release-details"><dt>目录</dt><dd>{{ state.path }} <button class="text-button" @click="copyPath(state.path)">复制</button></dd><dt>上游</dt><dd>{{ state.upstream || '未设置' }}</dd><dt>HEAD</dt><dd>{{ state.head }}</dd></dl><pre v-if="state.status" class="status-output">{{ state.status }}</pre><button @click="refreshStatus" :disabled="serviceBusy || busy || batchRunning">刷新当前工作区状态</button></details>
+        </section>
+        <section v-if="resolutionPreview" id="resolution-review-panel" class="panel" aria-labelledby="resolution-review-heading"><div class="preview-heading"><h2 id="resolution-review-heading">检查冲突修复结果</h2><button @click="resolutionPreview=null" :disabled="serviceBusy || busy || batchRunning || resolving">取消检查</button></div><p class="hint wrap">目标分支：<b>{{ resolutionPreview.branch }}</b> · {{ resolutionPreview.path }}</p><p class="hint">确认后保留合并待提交状态，不提交或推送；内容变化后须重新检查。</p><p>本次只会暂存以下 {{ resolutionPreview.files.length }} 个冲突文件，其他已暂存或未暂存改动保留。</p><ul class="conflicts"><li v-for="file in resolutionPreview.files" :key="file">{{ file }}</li></ul><pre class="diff" tabindex="0">{{ resolutionPreview.stat || '无内容差异，请核对文件与合并关系。' }}</pre><patch-review :patch="resolutionPreview.patch"></patch-review></section>
+        <section v-if="commitPreview" id="commit-review-panel" class="panel commit-panel" aria-labelledby="commit-heading">
+          <div class="preview-heading"><h2 id="commit-heading">{{ commitPreview.mode==='select' ? '选择当前分支改动' : commitPreview.mode==='worktree' ? '提交当前分支代码' : '提交本次合并' }}</h2><button @click="commitPreview=null" :disabled="serviceBusy || busy || batchRunning">取消</button></div>
+          <p class="hint wrap">本地分支：<b>{{ commitPreview.branch }}</b> · {{ commitPreview.path }} · 不推送</p>
+          <label for="commit-message">提交说明</label><textarea id="commit-message" v-model="commitMessage" :rows="commitPreview.mode==='merge' ? 8 : 3" maxlength="4096" :disabled="serviceBusy || busy || batchRunning" spellcheck="false"></textarea>
+          <p class="hint">标题格式：type: 描述，最多 108 字符；需求分支的 M-ID 须位于描述开头。{{ commitPreview.mode==='select' ? '填写后选择文件并预览提交。' : '修改说明后请更新预览。' }}</p>
+          <template v-if="commitPreview.mode==='select'">
+            <h3>选择需要暂存的文件</h3>
+            <p class="hint">已有暂存内容会一并进入提交预览。勾选文件会暂存该文件的全部改动；未勾选的未暂存改动保留。暂存后取消提交，文件仍留在暂存区。</p>
+            <div class="branch-selection-tools">
+              <label><input type="checkbox" :checked="allStageFilesSelected" :indeterminate="selectedStageCount>0 && !allStageFilesSelected" :disabled="serviceBusy || busy || batchRunning || resolving || !selectableStageFiles.length" @change="toggleAllStageFiles($event.target.checked)" aria-controls="branch-change-list">全选可暂存文件</label>
+              <span class="hint" role="status">已选 {{ selectedStageCount }} / {{ selectableStageFiles.length }} 个可暂存文件</span>
+            </div>
+            <ul id="branch-change-list" class="branch-change-list" aria-label="当前分支改动文件">
+              <li v-for="file in commitPreview.files" :key="file.path">
+                <label><input type="checkbox" :value="file.path" :checked="stageFiles.includes(file.path) || file.staged && !file.unstaged" :disabled="serviceBusy || busy || batchRunning || !file.unstaged && !file.untracked" @change="stageFiles=$event.target.checked ? [...stageFiles,file.path] : stageFiles.filter(path=>path!==file.path)"><span>{{ file.path }}</span></label>
+                <span class="hint">{{ file.untracked ? '未跟踪' : file.staged && file.unstaged ? '部分已暂存，勾选加入剩余改动' : file.staged ? '已暂存，将一并提交' : '未暂存' }}</span>
+              </li>
+            </ul>
+            <p v-if="!commitPreview.files.length" class="hint">当前分支没有待提交改动。</p>
+
+          </template>
+          <template v-else>
+            <p v-if="commitPreview.warning" class="hint">{{ commitPreview.warning }}</p>
+            <p class="hint">仅提交已预览的暂存内容；预览后内容变化会阻止提交。</p>
+            <h3>将提交的暂存文件</h3><pre class="diff" tabindex="0">{{ commitPreview.files || '无文件变更，将记录合并关系。' }}
+{{ commitPreview.stat }}</pre>
+            <details class="commit-diff"><summary>审查暂存差异</summary><patch-review :patch="commitPreview.patch"></patch-review></details>
+
+          </template>
+        </section>
+        <section v-if="pushPreview" id="push-review-panel" class="panel" aria-labelledby="push-heading"><div class="preview-heading"><h2 id="push-heading">确认推送</h2><button @click="pushPreview=null" :disabled="serviceBusy || busy || batchRunning">取消</button></div><p class="hint wrap">远端：{{ pushPreview.remote }} · {{ pushPreview.url }}</p><p>本地 <b>{{ pushPreview.branch }}</b> → <b>{{ pushPreview.ref }}</b></p><p class="hint">提交：{{ pushPreview.head }} · {{ pushPreview.first ? '首次创建远端分支；下方仅列相对已有远端引用的本地新增提交。' : '仅快进更新，不强推。' }}</p><h3>{{ pushPreview.count }} 个本地新增提交</h3><pre class="diff" tabindex="0">{{ pushPreview.commits || '无额外新增提交，将创建同名远端分支。' }}</pre><p class="hint">最多显示 80 条；本地或远端变化后需重新预览。保留项目 hooks。</p></section>
+        <section v-if="plan" id="merge-review-panel" class="panel preview" aria-label="合并差异审查"><div class="preview-heading"><div><div class="panel-label">来源变化审查</div><h2>{{ plan.count ? plan.count + ' 个待合入提交' : '来源已包含在目标中' }}</h2></div><button @click="plan=null" :disabled="serviceBusy || busy || batchRunning">关闭预览</button></div>
+          <p class="hint wrap">{{ sourceName }} → {{ state.branch }} · 来源 <span :title="plan.sourceSha">{{ plan.sourceSha.slice(0,10) }}</span> · 预览不代表最终合并结果或无冲突保证</p>
+          <p class="hint wrap">目标目录：{{ state.path }} · 最多显示 80 条提交。</p>
+          <p v-if="plan.count" id="merge-review-warning" class="notice warning">确认后将修改目标工作区和暂存区；有冲突时会自动交给 Codex 处理，并只暂存本次冲突文件。本次不会自动提交或推送；请暂停其他工具对目标工作区的写入。</p>
+          <div class="tabs" aria-label="预览内容"><button v-for="item in tabs" :key="item.id" :aria-pressed="tab===item.id" :class="{active:tab===item.id}" @click="tab=item.id">{{ item.name }}</button></div>
+          <patch-review v-if="tab==='patch'" :patch="plan.patch"></patch-review><pre v-else class="diff" tabindex="0">{{ plan[tab] || '（没有内容）' }}</pre>
+
+        </section>
+        <section v-else-if="!commitPreview && !pushPreview && !resolutionPreview && !result && !resolution && !previousResolution" class="review-placeholder" aria-label="差异审查提示"><div><h2>先看变化，再合并</h2><p>选择来源并预览后，在这里逐文件审查差异。</p></div><span>来源 → 目标 → 本地提交 → 单独推送</span></section>
+        <section v-if="result || resolution || previousResolution" class="panel result" aria-live="polite"><h2>{{ resultTitle }}</h2><p class="muted">{{ resultDescription }}</p><p v-if="resolution?.url && resolution.status!=='running'"><a :href="resolution.url">{{ resolution.kind==='repair' ? '在 Codex 中查看本次修复 ↗' : '在 Codex 中打开本次冲突任务 ↗' }}</a></p><p v-if="resolution?.warning" class="notice warning">{{ resolution.warning }}</p><p v-if="resolution?.logs" class="hint wrap">任务日志：{{ resolution.logs }}</p><details v-if="previousResolution"><summary>上次 Codex 冲突处理记录</summary><p class="hint">{{ previousResolution.summary }}</p><a v-if="previousResolution.url" :href="previousResolution.url">查看上次冲突会话 ↗</a></details><ul v-if="state.conflicts.length" class="conflicts"><li v-for="file in state.conflicts" :key="file">{{ file }}</li></ul><pre class="diff" tabindex="0">{{ canCommit ? '冲突已暂存，请检查暂存区并提交本次合并。' : result?.output || (resolution?.kind==='repair' ? '当前工作区的 Codex 修复记录；请从批量结果检查差异并继续。' : '当前工作区的 Codex 冲突处理记录') }}</pre><button @click="refreshStatus" :disabled="serviceBusy || busy || batchRunning">刷新当前工作区状态</button></section>
+        <details class="safety-details"><summary>操作规则与保护边界</summary><p>本地 master 允许合并和提交，仍禁止推送；有改动时阻止合并；冲突由 Codex 处理后仅暂存原始冲突文件。单次合并后检查并提交，批量模式经确认后逐项创建本地提交，推送均需单独确认。操作期间请暂停其他工具对同一工作区的写入。</p></details>
+      </template>
+      </div>
+      <div v-if="state" class="workspace-action-bar" role="region" aria-label="当前分支操作">
+        <div class="workspace-action-context"><strong :title="state.branch">{{ state.branch || '分离 HEAD' }}</strong><span v-if="busy" role="status">{{ busyLabel }} · {{ busySeconds }} 秒</span><span v-else>{{ resolutionPreview ? '检查冲突修复' : commitPreview?.mode==='select' ? '选择改动 · 已选 '+selectedStageCount+' 个' : commitPreview ? '提交预览 · 仅本地提交' : pushPreview ? '推送预览 · '+pushPreview.remote : plan ? sourceName+' → 当前分支' : '合并、提交和推送分别确认' }}</span></div>
+        <template v-if="resolutionPreview">
+          <button @click="resolutionPreview=null" :disabled="serviceBusy || busy || batchRunning || resolving">取消检查</button>
+          <button class="primary" @click="confirmResolution" :disabled="serviceBusy || busy || !canReviewResolution">确认暂存冲突文件</button>
+        </template>
+        <template v-else-if="commitPreview">
+          <button @click="commitPreview=null" :disabled="serviceBusy || busy || batchRunning">取消</button>
+          <template v-if="commitPreview.mode==='select'">
+            <button @click="reviewCurrentChanges(true)" :disabled="serviceBusy || busy || batchRunning">重新读取改动</button>
+            <button class="primary" @click="stageCurrentFiles" :disabled="serviceBusy || busy || batchRunning || !stageFiles.length && !commitPreview.files.some(file=>file.staged)">暂存所选并预览提交</button>
+          </template>
+          <template v-else>
+            <button v-if="commitMessage.trim()!==commitPreview.message" @click="previewCommit()" :disabled="serviceBusy || busy || batchRunning">更新预览</button>
+            <button class="primary" :title="'确认提交到 '+commitPreview.branch" @click="commitMerge" :disabled="serviceBusy || busy || batchRunning || !canConfirmCommit || commitMessage.trim()!==commitPreview.message">确认提交到 {{ commitPreview.branch }}</button>
+          </template>
+        </template>
+        <template v-else-if="pushPreview">
+          <button @click="pushPreview=null" :disabled="serviceBusy || busy || batchRunning">取消</button>
+          <button class="primary" :title="'确认推送到 '+pushPreview.remote+'/'+pushPreview.branch" @click="pushBranch" :disabled="serviceBusy || busy || batchRunning || !canPush">确认推送到 {{ pushPreview.remote }}/{{ pushPreview.branch }}</button>
+        </template>
+        <template v-else-if="plan">
+          <button @click="plan=null" :disabled="serviceBusy || busy || batchRunning">关闭预览</button>
+          <button class="primary" :title="'确认合并到 '+state.branch" aria-describedby="merge-review-warning" @click="merge" :disabled="serviceBusy || busy || batchRunning || resolving || !!state.blocked || !plan.count">确认合并到 {{ state.branch }}</button>
+        </template>
+        <template v-else>
+          <button :class="{primary:primaryMergeAction==='merge'}" @click="preview" :disabled="!!mergeReason" :title="mergeReason || '读取并预览来源变化'" aria-controls="merge-review-panel">预览合并</button>
+          <button :class="{primary:primaryMergeAction==='commit'}" @click="canCommit ? previewCommit(true) : reviewCurrentChanges()" :disabled="canCommit ? !!commitReason : !!currentCommitReason" :title="canCommit ? commitReason || '检查暂存内容并填写说明' : currentCommitReason || '选择改动文件并检查本地提交'" aria-controls="commit-review-panel">{{ canCommit ? '检查并提交合并' : '提交当前分支' }}</button>
+          <button :class="{primary:primaryMergeAction==='push'}" @click="previewPush" :disabled="!!pushReason" :title="pushReason || '预览并确认推送到同名远端分支'" aria-controls="push-review-panel">推送当前分支</button>
+        </template>
+      </div>
+      </section>
+    </main>
+    </div>
+  </div>
+</div><noscript>请启用 JavaScript。本工具使用本地打包的 Vue，无需联网。</noscript></body>
+</html>
