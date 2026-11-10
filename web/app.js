@@ -233,6 +233,8 @@ createApp({
       !!commitPreview.value || !!pushPreview.value || !!resolutionPreview.value);
     const projectSwitchLocked = computed(() => reloadLocked.value || !!plan.value || projectSettingsDirty.value);
     const desktop = globalThis.branchDeskDesktop;
+    const desktopWindowActions = typeof desktop?.windowAction === 'function';
+    function desktopWindowAction(action) { if (desktopWindowActions) desktop.windowAction(action); }
     function desktopCanLeave() {
       return !reloadLocked.value && !plan.value && !document.querySelector?.('dialog[open]');
     }
@@ -1738,7 +1740,7 @@ createApp({
       projects, currentProjectId, defaultProjectId, projectSettings, projectDialog, projectForm, projectError, projectBusy, feishuEnabled, feishuWarning, projectRules,
       serviceOptions, isBackendService, sharedBackendActive, pendingProject, chooseProjectDirectory,
       projectMetadata, projectPath, projectName, projectDisplayName, projectConnectStatus, projectMetadataBusy, projectMetadataWarning,
-      projectSettingsDirty, projectConfigDirty, projectSwitchLocked, desktopDirectoryPicker, loadProjects, openProjectDialog, closeProjectDialog, loadProjectMetadata, addProject, saveProjectSettings,
+      desktopWindowActions, desktopWindowAction, projectSettingsDirty, projectConfigDirty, projectSwitchLocked, desktopDirectoryPicker, loadProjects, openProjectDialog, closeProjectDialog, loadProjectMetadata, addProject, saveProjectSettings,
       setDefaultProject, removeProject, connectProject,
       mergePane, expandedBranch, overviewPane, branchSort, branchFilters, orderedBranchGroups, branchDetailsId, branchWorkspace,
       toggleBranchDetails, closeBranchDetails, enterReview, returnToOverview, positionToolbarMenu,

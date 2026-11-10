@@ -13,12 +13,12 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 ShowInstDetails show
 ShowUninstDetails show
-VIProductVersion "2026.11.10.1"
+VIProductVersion "2026.11.10.2"
 Icon "${__FILEDIR__}\BranchDesk.ico"
 UninstallIcon "${__FILEDIR__}\BranchDesk.ico"
 VIAddVersionKey /LANG=2052 "ProductName" "Branch Desk"
 VIAddVersionKey /LANG=2052 "FileDescription" "Branch Desk Windows x64 安装程序"
-VIAddVersionKey /LANG=2052 "FileVersion" "2026.11.10.1"
+VIAddVersionKey /LANG=2052 "FileVersion" "2026.11.10.2"
 VIAddVersionKey /LANG=2052 "LegalCopyright" "Branch Desk"
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TEXT "安装本地分支与服务工作台。$\r$\n$\r$\n适用 Windows 10/11 x64，按当前用户安装，无需管理员权限。$\r$\n需已安装 Git for Windows 与 WebView2 Runtime。Python 和 .NET 随应用提供。$\r$\n$\r$\n安装后不会自动启动工作台或业务服务。"
@@ -52,7 +52,7 @@ FunctionEnd
   Pop $0
   Pop $1
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "工作台仍在运行或状态无法确认。请在窗口菜单关闭工作台后台并退出所有窗口，然后重试。$\r$\n$\r$\n$1"
+    MessageBox MB_ICONSTOP "工作台仍在运行或状态无法确认。请在“更多操作”菜单关闭工作台后台并退出所有窗口，然后重试。$\r$\n$\r$\n$1"
     Abort
   ${EndIf}
   idle:
@@ -92,7 +92,7 @@ Section "Branch Desk" SEC_APP
   CreateShortCut "$SMPROGRAMS\Branch Desk\使用与 Codex 排障手册.lnk" "$INSTDIR\docs\Windows使用与Codex排障手册.html"
   CreateShortCut "$DESKTOP\Branch Desk.lnk" "$INSTDIR\BranchDesk.exe" "" "$INSTDIR\app\windows\BranchDesk.ico" 0
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BranchDesk" "DisplayName" "Branch Desk"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BranchDesk" "DisplayVersion" "2026.11.10.1"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BranchDesk" "DisplayVersion" "2026.11.10.2"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BranchDesk" "DisplayIcon" "$INSTDIR\BranchDesk.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BranchDesk" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\BranchDesk" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'

@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import zipfile
 
-VERSION = '2026.11.10.1'
+VERSION = '2026.11.10.2'
 PYTHON_ARCHIVE = 'python-3.14.10-embed-amd64.zip'
 PSUTIL_ARCHIVE = 'psutil-7.2.2-cp37-abi3-win_amd64.whl'
 EXPECTED = {

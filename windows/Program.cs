@@ -26,8 +26,6 @@ internal sealed class DeskWindow : Form
 {
     const string LauncherUrl = "https://branch-desk.local/";
     readonly string root = AppContext.BaseDirectory;
-    readonly ToolStripMenuItem home = new("选择项目 / 重新连接");
-    readonly ToolStripMenuItem stop = new("关闭所有空闲工作台后台…");
     readonly List<Project> projects = [];
     string? selectedId;
     string message = "";
@@ -42,16 +40,6 @@ internal sealed class DeskWindow : Form
         Font = new Font("Microsoft YaHei UI", 10);
         BackColor = Color.FromArgb(247, 249, 250);
         Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
-        var menu = new MenuStrip { BackColor = Color.FromArgb(31, 35, 43), ForeColor = Color.FromArgb(226, 232, 240),
-            Padding = new Padding(12, 4, 12, 4), Visible = false, Renderer = new ToolStripProfessionalRenderer(new DeskColors()) };
-        var window = new ToolStripMenuItem("项目与窗口");
-        window.DropDownItems.AddRange([home, stop]);
-        var guide = new ToolStripMenuItem("使用帮助");
-        guide.Click += (_, _) => OpenDocument("Windows使用与Codex排障手册.html");
-        menu.Items.AddRange([window, guide]);
-        MainMenuStrip = menu; Controls.Add(menu);
-        home.Click += async (_, _) => { if (await CanLeave()) await ShowWelcome(); };
-        stop.Click += async (_, _) => await StopBackends();
         Shown += async (_, _) =>
         {
             try { await EnsureWebView(); await ShowWelcome(); }
@@ -62,7 +50,7 @@ internal sealed class DeskWindow : Form
 
     void SetBusy(bool value)
     {
-        busy = value; home.Enabled = stop.Enabled = !value;
+        busy = value;
         RenderLauncher();
     }
 
@@ -77,19 +65,32 @@ internal sealed class DeskWindow : Form
 
     async Task ShowWelcome()
     {
-        loaded = false; MainMenuStrip!.Visible = false;
+        loaded = false;
         web!.CoreWebView2.Navigate(LauncherUrl);
         await LoadProjects();
     }
 
     async void LauncherMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
-        // Only our embedded startup document may invoke native launcher actions.
-        if (loaded || e.Source != LauncherUrl) return;
+        bool launcher = !loaded && e.Source == LauncherUrl;
+        bool workbench = loaded && IsWorkbench(e.Source) && web?.Source != null &&
+            new Uri(e.Source).GetLeftPart(UriPartial.Path) == web.Source.GetLeftPart(UriPartial.Path);
+        if (!launcher && !workbench) return;
         try
         {
             var data = JsonDocument.Parse(e.WebMessageAsJson).RootElement;
             string? action = data.GetProperty("action").GetString();
+            if (workbench)
+            {
+                if (busy) return;
+                switch (action)
+                {
+                    case "home": if (await CanLeave()) await ShowWelcome(); break;
+                    case "help": OpenDocument("Windows使用与Codex排障手册.html"); break;
+                    case "shutdown": await StopBackends(); break;
+                }
+                return;
+            }
             if (action == "ready") { RenderLauncher(); return; }
             if (busy) return;
             switch (action)
@@ -181,14 +182,14 @@ internal sealed class DeskWindow : Form
         string data = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Branch Desk WebView2");
         var control = new WebView2 { Dock = DockStyle.Fill };
         control.DefaultBackgroundColor = Color.FromArgb(247, 249, 250);
-        Controls.Add(control); control.BringToFront(); MainMenuStrip!.BringToFront();
+        Controls.Add(control); control.BringToFront();
         try
         {
             await control.EnsureCoreWebView2Async(await CoreWebView2Environment.CreateAsync(userDataFolder: data));
             control.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             control.CoreWebView2.Settings.AreDevToolsEnabled = true;
             control.CoreWebView2.Settings.IsStatusBarEnabled = false;
-            await control.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync("window.branchDeskDesktop = {};");
+            await control.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync("window.branchDeskDesktop = { windowAction: action => window.chrome.webview.postMessage({ action }) };");
             control.CoreWebView2.NavigationStarting += (_, e) =>
             {
                 if (IsWorkbench(e.Uri) || (!loaded && e.Uri == LauncherUrl)) return;
@@ -198,7 +199,7 @@ internal sealed class DeskWindow : Form
             control.CoreWebView2.NewWindowRequested += (_, e) => { e.Handled = true; if (e.IsUserInitiated) OpenExternal(e.Uri); };
             control.CoreWebView2.PermissionRequested += (_, e) => e.State = CoreWebView2PermissionState.Deny;
             control.CoreWebView2.DownloadStarting += (_, e) => e.Cancel = true;
-            control.CoreWebView2.ProcessFailed += (_, _) => MessageBox.Show(this, "页面进程异常，请从窗口菜单重新连接。后台任务不会自动重试。", "Branch Desk");
+            control.CoreWebView2.ProcessFailed += (_, _) => MessageBox.Show(this, "页面进程异常，请重新打开 Branch Desk。后台任务不会自动重试。", "Branch Desk");
             control.CoreWebView2.AddWebResourceRequestedFilter(LauncherUrl, CoreWebView2WebResourceContext.Document);
             control.CoreWebView2.WebResourceRequested += (_, e) =>
             {
@@ -241,7 +242,7 @@ internal sealed class DeskWindow : Form
             var data = await Bridge("connect", "--id", project.Id, "--start");
             string? url = data.GetProperty("url").GetString();
             if (url == null || !IsWorkbench(url)) throw new IOException("连接地址无效，未打开页面。");
-            loaded = true; MainMenuStrip!.Visible = true; web!.Source = new Uri(url); MainMenuStrip.BringToFront();
+            loaded = true; web!.Source = new Uri(url);
         }
         catch (Exception e) { message = e.Message; error = true; }
         finally { SetBusy(false); }
@@ -282,12 +283,4 @@ internal sealed class DeskWindow : Form
         try { if (await CanLeave()) { allowClose = true; Close(); } }
         finally { checkingClose = false; }
     }
-}
-
-internal sealed class DeskColors : ProfessionalColorTable
-{
-    public override Color MenuItemSelected => Color.FromArgb(56, 65, 78);
-    public override Color MenuItemBorder => Color.FromArgb(56, 65, 78);
-    public override Color MenuItemPressedGradientBegin => Color.FromArgb(56, 65, 78);
-    public override Color MenuItemPressedGradientEnd => Color.FromArgb(56, 65, 78);
 }

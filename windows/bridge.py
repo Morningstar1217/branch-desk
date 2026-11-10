@@ -65,7 +65,7 @@ def install_check():
         except psutil.AccessDenied:
             raise ValueError('无法检查当前用户进程，请关闭工作台后重试。') from None
     if active:
-        raise ValueError('请先在工作台窗口菜单关闭后台，再退出所有窗口：' + ', '.join(active))
+        raise ValueError('请先在工作台“更多操作”菜单关闭后台，再退出所有窗口：' + ', '.join(active))
     return dict(status='ok')
 
 

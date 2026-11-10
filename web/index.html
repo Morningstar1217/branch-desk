@@ -233,6 +233,12 @@
         <div id="workspace-more-menu" popover="auto" class="source-menu workspace-action-popover" role="group" aria-label="更多操作" @beforetoggle="positionToolbarMenu" @click.capture="$event.target.closest('button:not(:disabled)') && $event.currentTarget.hidePopover()">
           <button type="button" @click="scanCleanup" :disabled="serviceBusy || busy || batchRunning || resolving" title="只读初筛，释放前仍需逐个检查确认">清理候选</button>
           <button type="button" @click="fetchRemote" :disabled="serviceBusy || busy || batchRunning || resolving" title="从 origin 获取最新引用，不修改工作区">刷新远端引用</button>
+          <template v-if="desktopWindowActions">
+            <hr>
+            <button type="button" @click="desktopWindowAction('home')" :disabled="navigationLocked">选择项目 / 重新连接</button>
+            <button type="button" @click="desktopWindowAction('help')">使用帮助</button>
+            <button type="button" @click="desktopWindowAction('shutdown')" :disabled="navigationLocked">关闭空闲工作台后台…</button>
+          </template>
         </div>
         <button type="button" @click="refresh" :disabled="serviceBusy || busy || batchRunning">刷新列表</button>
       </div></div>
