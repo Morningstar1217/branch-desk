@@ -22,7 +22,7 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" "Branch Desk"
 !define MUI_WELCOMEPAGE_TEXT "安装本地分支与服务工作台。$\r$\n$\r$\n适用 Windows 10/11 x64，按当前用户安装，无需管理员权限。$\r$\n需已安装 Git for Windows 与 WebView2 Runtime。Python 和 .NET 随应用提供。$\r$\n$\r$\n安装后不会自动启动工作台或业务服务。"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
-!define MUI_FINISHPAGE_TEXT "安装完成。请从桌面或开始菜单打开 Branch Desk，按使用手册添加你自己的项目。$\r$\n$\r$\n本版本已完成跨平台编译及静态回归，尚未在 Windows 真机验收。"
+!define MUI_FINISHPAGE_TEXT "安装完成。请从桌面或开始菜单打开 Branch Desk，按使用手册添加你自己的项目。$\r$\n$\r$\n实际验证范围请参阅 docs 目录中的发布验证说明。"
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
