@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+windows/bin/
+windows/obj/
+.env
+state/
+dist/
