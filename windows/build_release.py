@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import zipfile
 
-VERSION = '2026.11.04.3'
+VERSION = '2026.11.10.1'
 PYTHON_ARCHIVE = 'python-3.14.10-embed-amd64.zip'
 PSUTIL_ARCHIVE = 'psutil-7.2.2-cp37-abi3-win_amd64.whl'
 EXPECTED = {
@@ -22,7 +22,7 @@ MODULES = ('server.py', 'platform_config.py', 'platform_support.py', 'workbench_
 WEB = ('index.html', 'app.js', 'style.css', 'schedule.js', 'batch.js', 'favicon.svg',
        'vendor/vue.global.prod.js', 'vendor/VUE-LICENSE')
 WINDOWS = ('Program.cs', 'BranchDesk.csproj', 'packages.lock.json', 'app.manifest', 'bridge.py',
-           'installer.nsi', 'build_release.py')
+           'installer.nsi', 'build_release.py', 'launcher.html', 'BranchDesk.ico', 'generate_icon.ps1')
 
 
 def digest(path):
