@@ -436,7 +436,7 @@ const SchedulePanel = {
       releaseRangePending, releaseSelectionLocked, refreshRelease, chooseReleasePreset, switchScheduleView, toggleAllReleases, mergeSelectedReleases,
       rowFilter, rowFilters, refreshedAt, loadedRange, localDrafts, pendingDraft, draftWarning, draftSaved, draftDirty, hasDraft, restoreDraft, discardDraft, requestLeave, moreId, moreToggled, selectMore,
       rows, busy, error, editor, draft, plan, development, developmentReady, developmentError, developing,
-      links, linksReady, linksError, linkDialog, linkRow, linkRef, linkSearch, linkExpected, linkOptions, linkValid, locked, openLink, saveLink, openLinkedBranch,
+      links, linksReady, linksError, readLinks, linkDialog, linkRow, linkRef, linkSearch, linkExpected, linkOptions, linkValid, locked, openLink, saveLink, openLinkedBranch,
       startDevelopment, display, formatTotal, refresh, week, shiftWeek, edit, cancel, openItem, clear, preview, save };
   },
   template: `

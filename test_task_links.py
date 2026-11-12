@@ -48,7 +48,24 @@ class MetadataChecks(unittest.TestCase):
         self.assertEqual(reloaded.tasks()['123']['thread_url'], 'codex://threads/fixture')
         reloaded.bind_task('123', '', 'refs/heads/M-123-topic')
         self.assertEqual(reloaded.tasks()['123']['thread_url'], 'codex://threads/fixture')
+        unlinked = OperationHistory(self.file, '/fixture/common').tasks()['123']
+        self.assertEqual((unlinked['branch_ref'], unlinked['unlinked_ref']), ('', 'refs/heads/M-123-topic'))
+        self.assertGreater(unlinked['unlinked_at'], 0)
+        with self.assertRaisesRegex(ValueError, '关联已变化'):
+            reloaded.bind_task('123', '', 'refs/heads/M-123-topic')
+        self.assertEqual(reloaded.tasks()['123']['unlinked_at'], unlinked['unlinked_at'])
         self.assertEqual(OperationHistory(self.file, '/different').tasks(), {})
+
+    def test_unlink_and_its_record_roll_back_together_when_recording_fails(self):
+        self.history.bind_task('123', 'refs/heads/topic', '')
+        with closing(sqlite3.connect(self.file)) as db, db:
+            db.execute("CREATE TRIGGER reject_unlink_record BEFORE UPDATE OF unlinked_ref ON task_links "
+                       "BEGIN SELECT RAISE(ABORT, 'fixture storage failure'); END")
+        with self.assertRaises(ValueError):
+            self.history.bind_task('123', '', 'refs/heads/topic')
+        with closing(sqlite3.connect(self.file)) as db:
+            row = db.execute('SELECT branch_ref, unlinked_ref, unlinked_at FROM task_links').fetchone()
+        self.assertEqual(row, ('refs/heads/topic', '', None))
 
     def test_same_task_id_stays_separate_across_feishu_spaces(self):
         self.history.remember_development(dict(work_item_id='123', status='finished', url='codex://threads/fixture'))
@@ -140,6 +157,74 @@ class TaskRequestChecks(unittest.TestCase):
         self.assertEqual(self.request({}, route='task-links')[0], 200)
         guard.assert_not_called()
         self.assertEqual(self.request(dict(work_item_id='123', ref='refs/heads/topic', expected_ref='', confirmed=True))[0], 400)
+
+    def test_batch_unlink_checks_every_item_preserves_sessions_and_skips_changed_or_recreated_branches(self):
+        for identifier, ref in [('123', 'refs/heads/deleted'), ('124', 'refs/heads/topic'), ('125', 'refs/heads/new-link')]:
+            self.history.bind_task(identifier, ref, '')
+        self.history.remember_development(dict(work_item_id='123', status='finished', url='codex://threads/fixture'))
+        data = dict(space_id='62983005bc43adc6923d707d',
+                    confirmed=True, missing_only=True, items=[
+                        dict(work_item_id='123', expected_ref='refs/heads/deleted'),
+                        dict(work_item_id='124', expected_ref='refs/heads/topic'),
+                        dict(work_item_id='125', expected_ref='refs/heads/old-link')])
+        status, result = self.request(data, route='task-links/unbind')
+        self.assertEqual(status, 200)
+        self.assertEqual([row['status'] for row in result['results']], ['succeeded', 'skipped', 'skipped'])
+        self.assertEqual(result['items']['123']['branch_ref'], '')
+        self.assertEqual(result['items']['123']['unlinked_ref'], 'refs/heads/deleted')
+        self.assertEqual(result['items']['123']['thread_url'], 'codex://threads/fixture')
+        self.assertEqual(result['items']['124']['branch_ref'], 'refs/heads/topic')
+        self.assertEqual(result['items']['125']['branch_ref'], 'refs/heads/new-link')
+        first_time = result['items']['123']['unlinked_at']
+        self.assertEqual(self.request(data, route='task-links/unbind')[1]['results'][0]['status'], 'skipped')
+        self.assertEqual(self.history.tasks()['123']['unlinked_at'], first_time)
+        self.assertEqual(OperationHistory(self.history.filename, '/other-repository').tasks(), {})
+        self.assertEqual(self.history.tasks('other-space'), {})
+
+    def test_batch_unlink_validates_confirmation_space_and_entire_selection_before_writing(self):
+        self.history.bind_task('123', 'refs/heads/deleted', '')
+        item = dict(work_item_id='123', expected_ref='refs/heads/deleted')
+        data = dict(space_id='62983005bc43adc6923d707d', confirmed=True, missing_only=True, items=[item])
+        for changes in [dict(confirmed=False), dict(space_id='other'), dict(items=[]), dict(items=[item, item]),
+                        dict(missing_only='true'), dict(items=[item, dict(work_item_id='124', expected_ref='refs/heads/master')]),
+                        dict(items=[item] * 101)]:
+            with self.subTest(changes=changes):
+                self.assertEqual(self.request({**data, **changes}, route='task-links/unbind')[0], 400)
+                self.assertEqual(self.history.tasks()['123']['branch_ref'], 'refs/heads/deleted')
+        self.assertEqual(self.request(data, token='wrong', route='task-links/unbind')[0], 400)
+        self.repo.batch = SimpleNamespace(guard=Mock(side_effect=ValueError('queue running')))
+        self.assertEqual(self.request(data, route='task-links/unbind')[0], 400)
+        self.assertEqual(self.history.tasks()['123']['branch_ref'], 'refs/heads/deleted')
+
+    def test_explicit_cleanup_unlinks_a_remaining_local_branch_and_reports_storage_failure(self):
+        self.history.bind_task('123', 'refs/heads/topic', '')
+        data = dict(space_id='62983005bc43adc6923d707d', confirmed=True, missing_only=False,
+                    items=[dict(work_item_id='123', expected_ref='refs/heads/topic')])
+        self.repo.branches.return_value[0]['path'] = '/fixture/recreated-worktree'
+        self.assertEqual(self.request(data, route='task-links/unbind')[1]['results'][0]['status'], 'skipped')
+        self.assertEqual(self.history.tasks()['123']['branch_ref'], 'refs/heads/topic')
+        self.repo.branches.return_value[0]['path'] = ''
+        self.assertEqual(self.request(data, route='task-links/unbind')[1]['results'][0]['status'], 'succeeded')
+        self.history.bind_task('123', 'refs/heads/topic', '')
+        self.history.bind_task = Mock(side_effect=ValueError('storage unavailable'))
+        status, result = self.request(data, route='task-links/unbind')
+        self.assertEqual(status, 200)
+        self.assertEqual(result['results'][0]['status'], 'failed')
+        self.assertEqual(self.history.tasks()['123']['branch_ref'], 'refs/heads/topic')
+
+    def test_hundred_item_batch_accepts_long_unicode_branch_names(self):
+        items = []
+        for index in range(100):
+            identifier = str(2000 + index)
+            ref = 'refs/heads/M-' + identifier + '-' + '已交付需求' * 8
+            self.history.bind_task(identifier, ref, '')
+            items.append(dict(work_item_id=identifier, expected_ref=ref))
+        data = dict(space_id='62983005bc43adc6923d707d', confirmed=True, missing_only=True, items=items)
+        self.assertGreater(len(json.dumps(data).encode()), 8192)
+        status, result = self.request(data, route='task-links/unbind')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(result['results']), 100)
+        self.assertTrue(all(row['status'] == 'succeeded' for row in result['results']))
 
 
 class LifecycleChecks(unittest.TestCase):

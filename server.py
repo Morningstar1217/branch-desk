@@ -100,6 +100,7 @@ class Repository:
         self.push_plans = {}
         self.release_plans = {}
         self.branch_delete_plans = {}
+        self.merged_cleanup_plans = {}
         self.history = None
         self.resolver = ConflictResolver(git)
         self.batch = BatchMerger(self)
@@ -494,6 +495,118 @@ class Repository:
         self.plans.clear()
         self.push_plans.clear()
         return dict(branch=context['branch'])
+
+    def merged_cleanup_base(self):
+        self.batch.guard()
+        self.resolver.guard()
+        if self.common_dir(self.root) != self.common:
+            raise GuardError('仓库归属已变化，请重启工具。')
+        root = self.snapshot(self.root)
+        if root['operations']:
+            raise GuardError('启动工作区正在进行 Git 操作，请结束后再清理分支。')
+        ref = 'refs/remotes/origin/master'
+        baseline = next((item for item in self.refs() if item['ref'] == ref), None)
+        if not baseline:
+            raise GuardError('缺少 origin/master 本地引用，请先点击右上角“刷新”，再检查已合并分支。')
+        return root, baseline
+
+    def merged_cleanup_context(self, ref, discard_ignored=False):
+        if type(discard_ignored) is not bool:
+            raise GuardError('忽略文件清理选项必须是布尔值。')
+        root, baseline = self.merged_cleanup_base()
+        item = next((r for r in self.refs() if r['ref'] == ref and r['ref'].startswith('refs/heads/')), None)
+        if not item:
+            raise GuardError('只能清理当前仓库已存在的本地分支。')
+        branch = item['name']
+        if branch in ('master', 'main', 'pre', 'test') or 'sentry' in branch.casefold():
+            raise GuardError('环境分支和 Sentry 分支保留，不参与批量清理。')
+        pinned = read_pinned(self.common) or []
+        if ref in pinned or 'refs/remotes/origin/' + branch in pinned:
+            raise GuardError('常用分支保留，请在单项操作中处理。')
+        if branch == root['branch']:
+            raise GuardError('工具启动工作区的当前分支保留。')
+        if git(self.root, 'merge-base', '--is-ancestor', item['sha'], baseline['sha'], allowed=(0, 1))[0]:
+            raise GuardError('尚未完整合入 origin/master，保留本地分支。')
+        parts = git(self.root, 'for-each-ref', '--format=%(upstream)%00%(upstream:remotename)%00%(upstream:remoteref)', ref)[1].rstrip('\n').split('\0')
+        upstream = parts[0]
+        if upstream and (len(parts) != 3 or parts[1] in ('', '.') or parts[2] != ref):
+            raise GuardError('上游不是同名远端分支，请先核对跟踪配置。')
+        # Git branch -d also checks the same-name upstream, or the launch HEAD without one.
+        delete_base = git(self.root, 'rev-parse', '--verify', upstream + '^{commit}')[1].strip() if upstream else root['head']
+        if git(self.root, 'merge-base', '--is-ancestor', item['sha'], delete_base, allowed=(0, 1))[0]:
+            raise GuardError('虽然已合入 origin/master，但普通删除的同名上游或启动目录 HEAD 尚未包含该分支；请在单项操作中检查。')
+        trees = [tree for tree in self.worktrees() if tree['branch'] == branch]
+        if len(trees) > 1:
+            raise GuardError('分支被多个 worktree 占用，请先人工检查。')
+        release = self.release_context(trees[0]['path'], force=discard_ignored) if trees else None
+        return dict(ref=ref, branch=branch, head=item['sha'], upstream=upstream, delete_base=delete_base,
+                    base_ref=baseline['ref'], base=baseline['sha'], root_path=root['path'],
+                    root_head=root['head'], root_branch=root['branch'], force=discard_ignored, release=release)
+
+    def merged_cleanup_list(self, discard_ignored=False):
+        if type(discard_ignored) is not bool:
+            raise GuardError('忽略文件清理选项必须是布尔值。')
+        _, baseline = self.merged_cleanup_base()
+        rows = []
+        for branch in self.branches():
+            if not branch['ref'].startswith('refs/heads/'):
+                continue
+            reason = ''
+            try:
+                self.merged_cleanup_context(branch['ref'], discard_ignored)
+            except (GuardError, ValueError, OSError) as error:
+                reason = str(error)
+            rows.append(dict(**branch, reason=reason))
+        return dict(root=self.root, base_ref=baseline['ref'], base=baseline['sha'], rows=rows)
+
+    def preview_merged_cleanup(self, ref, discard_ignored=False):
+        context = self.merged_cleanup_context(ref, discard_ignored)
+        identifier = secrets.token_urlsafe(24)
+        self.merged_cleanup_plans = {key: plan for key, plan in self.merged_cleanup_plans.items()
+                                     if time.monotonic() - plan['time'] < 600}
+        if len(self.merged_cleanup_plans) >= 100:
+            self.merged_cleanup_plans.clear()
+        self.merged_cleanup_plans[identifier] = dict(context=context, time=time.monotonic())
+        release = context['release'] or {}
+        return dict(plan=identifier, **{key: context[key] for key in
+                    ('ref', 'branch', 'head', 'upstream', 'base_ref', 'base', 'root_path', 'force')},
+                    path=release.get('path', ''), ignored=release.get('ignored', []), generated=release.get('generated', []))
+
+    def cleanup_merged_branch(self, identifier, confirmation=None, discard_confirmation=None):
+        plan = self.merged_cleanup_plans.pop(identifier, None) if isinstance(identifier, str) else None
+        if not plan or time.monotonic() - plan['time'] >= 600:
+            raise GuardError('已合并分支清理预览已失效，请重新预览。')
+        context = plan['context']
+        if confirmation is not True:
+            raise GuardError('请先确认释放 worktree 并删除所选本地分支。')
+        release = context['release']
+        if release and release['ignored'] and discard_confirmation is not True:
+            raise GuardError('清理忽略文件须单独二次确认，请重新预览。')
+        if self.merged_cleanup_context(context['ref'], context['force']) != context:
+            raise GuardError('分支、工作区或合并基准已变化，请重新预览。')
+        result = dict(branch=context['branch'], head=context['head'], path=release['path'] if release else '',
+                      released=False, deleted=False, status='failed', error='')
+        try:
+            if release:
+                checked = self.preview_release(release['path'], force=context['force'])
+                # Recheck the reviewed inventory too; preview_release must never silently renew changed files.
+                if self.merged_cleanup_context(context['ref'], context['force']) != context:
+                    raise GuardError('释放前现场已变化，请重新预览。')
+                self.release_worktree(checked['plan'], confirmation=True)
+                result['released'] = True
+            root, baseline = self.merged_cleanup_base()
+            if (baseline['sha'] != context['base'] or root['head'] != context['root_head'] or
+                    root['branch'] != context['root_branch']):
+                raise GuardError('释放后合并基准或启动工作区已变化，保留本地分支。')
+            deletion = self.preview_branch_delete(context['ref'])
+            if (deletion['head'] != context['head'] or deletion['upstream'] != context['upstream'] or
+                    deletion['base'] != context['delete_base']):
+                raise GuardError('释放后分支或同名上游已变化，保留本地分支。')
+            self.delete_branch(deletion['plan'], confirmation=True)
+            result.update(deleted=True, status='succeeded')
+        except (GuardError, ValueError, OSError) as error:
+            result['error'] = str(error)
+        return result
 
     def fetch_remote(self):
         self.resolver.guard()
@@ -1274,12 +1387,15 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Content-Type") != "application/json":
                 raise GuardError("请求格式错误")
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 < size < 8192:
+            limit = 131072 if self.path == '/api/task-links/unbind' else 8192
+            if not 0 < size < limit:
                 raise GuardError("请求体长度错误")
             data = json.loads(self.rfile.read(size))
             if not isinstance(data, dict):
                 raise GuardError("请求格式错误")
             repo = self.server.repo
+            if getattr(self.server, 'restart_requested', False) is True and self.path != '/api/runtime':
+                raise GuardError('工作台正在重启，请等待重新连接。')
             if self.path.startswith('/api/projects/'):
                 return self.project_action(repo, data)
             if (getattr(repo, 'batch', None) and self.path not in
@@ -1288,14 +1404,24 @@ class Handler(BaseHTTPRequestHandler):
                 repo.batch.guard()
             if self.path == '/api/runtime':
                 result = self.server.runtime.identity
-            elif self.path == '/api/runtime/shutdown':
+            elif self.path in ('/api/runtime/shutdown', '/api/runtime/restart'):
+                restart = self.path == '/api/runtime/restart'
                 if data.get('confirmed') is not True:
-                    raise GuardError('请明确确认关闭工作台后台。')
+                    raise GuardError('请明确确认' + ('重启' if restart else '关闭') + '工作台后台。')
+                if restart and data.get('expected_identity') != self.server.runtime.identity['identity']:
+                    raise GuardError('工作台实例已变化，请重新读取后确认。')
                 repo.resolver.guard()
                 if any(job['status'] == 'running' for job in self.server.development.status().values()):
-                    raise GuardError('开发读取任务仍在运行，请等待结束后关闭。')
-                self.reply(200, {'status': 'stopping'})
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                    raise GuardError('开发读取任务仍在运行，请等待结束后操作工作台。')
+                if restart:
+                    self.server.restart_requested = True
+                try:
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+                except (RuntimeError, OSError):
+                    if restart:
+                        self.server.restart_requested = False
+                    raise GuardError('工作台停止任务未能启动，请检查后台状态后重试。') from None
+                self.reply(200, {'status': 'restarting' if restart else 'stopping'})
                 return
             elif self.path == '/api/preferences':
                 if set(data) != {'pinned'}:
@@ -1371,6 +1497,44 @@ class Handler(BaseHTTPRequestHandler):
                 result = dict(items=repo.history.tasks(self.server.schedule.space_id), warning=repo.history.warning)
                 if result['warning']:
                     raise GuardError(result['warning'])
+            elif self.path == '/api/task-links/unbind':
+                self.server.schedule.ensure_enabled()
+                space_id = self.server.schedule.space_id
+                items = data.get('items')
+                missing_only = data.get('missing_only')
+                if (data.get('confirmed') is not True or data.get('space_id') != space_id or
+                        not isinstance(missing_only, bool) or not isinstance(items, list) or not 0 < len(items) <= 100):
+                    raise GuardError('请重新预览当前空间的 1–100 项关联，并明确确认。')
+                selected = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise GuardError('关联清单格式错误，请重新预览。')
+                    identifier = FeishuProject.identifier(item.get('work_item_id'))
+                    expected = item.get('expected_ref')
+                    if (not isinstance(expected, str) or not expected.startswith('refs/heads/') or
+                            expected == 'refs/heads/master' or len(expected) > 1024):
+                        raise GuardError('关联清单包含无效的本地需求分支，请重新预览。')
+                    selected.append((identifier, expected))
+                if len({identifier for identifier, _ in selected}) != len(selected):
+                    raise GuardError('关联清单包含重复需求，请重新选择。')
+                outcomes = []
+                for identifier, expected in selected:
+                    try:
+                        if self.server.schedule.space_id != space_id:
+                            raise GuardError('飞书空间已变化，请重新预览。')
+                        branch = next((branch for branch in repo.branches() if branch['ref'] == expected), None)
+                        if missing_only and branch:
+                            outcomes.append(dict(work_item_id=identifier, status='skipped', error='本地分支已存在，请重新检查。'))
+                            continue
+                        if branch and branch.get('path') and not branch.get('missing'):
+                            outcomes.append(dict(work_item_id=identifier, status='skipped', error='分支仍有工作区，请在排期核对关联。'))
+                            continue
+                        repo.history.bind_task(identifier, '', expected, space_id)
+                        outcomes.append(dict(work_item_id=identifier, status='succeeded', error=''))
+                    except (ValueError, GuardError) as error:
+                        status = 'skipped' if str(error).startswith('任务关联已变化') else 'failed'
+                        outcomes.append(dict(work_item_id=identifier, status=status, error=str(error)))
+                result = dict(results=outcomes, items=repo.history.tasks(space_id), warning=repo.history.warning)
             elif self.path == "/api/fetch":
                 result = repo.fetch_remote()
             elif self.path == "/api/target":
@@ -1385,6 +1549,15 @@ class Handler(BaseHTTPRequestHandler):
                 result = repo.update_branch(data.get('path'), data.get('branch'), data.get('head'), data.get('confirmed'))
             elif self.path == '/api/codex/new':
                 result = repo.open_codex_conversation(data.get('path'), data.get('branch'))
+            elif self.path in ('/api/branch/merged/list', '/api/branch/merged/preview', '/api/branch/merged/delete'):
+                if any(job['status'] == 'running' for job in self.server.development.status().values()):
+                    raise GuardError('开发读取任务仍在运行，请等待结束后清理分支。')
+                if self.path.endswith('/list'):
+                    result = repo.merged_cleanup_list(data.get('discard_ignored', False))
+                elif self.path.endswith('/preview'):
+                    result = repo.preview_merged_cleanup(data.get('ref'), data.get('discard_ignored', False))
+                else:
+                    result = repo.cleanup_merged_branch(data.get('plan'), data.get('confirmation'), data.get('discard_confirmation'))
             elif self.path in ('/api/branch/delete/preview', '/api/branch/delete'):
                 if any(job['status'] == 'running' for job in self.server.development.status().values()):
                     raise GuardError('开发读取任务仍在运行，请等待结束后删除分支。')
@@ -1452,15 +1625,28 @@ def main():
     parser.add_argument("--port", type=int, default=0, help="默认自动分配空闲端口")
     parser.add_argument("--no-browser", action="store_true", help="由 Codex 启动器打开页面，不启动系统浏览器")
     args = parser.parse_args()
+    restart_token = os.environ.pop('BRANCH_DESK_RESTART_TOKEN', '')
+    if restart_token and not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', restart_token):
+        raise WorkbenchRuntimeError('工作台重启会话无效，请重新启动。')
+    if restart_token and platform.IS_WINDOWS:
+        # Let the previous server exit before instance discovery checks for unregistered servers.
+        psutil = platform.windows_psutil()
+        try:
+            psutil.Process(os.getppid()).wait(timeout=5)
+        except psutil.NoSuchProcess:
+            pass
+        except (psutil.TimeoutExpired, psutil.AccessDenied):
+            raise WorkbenchRuntimeError('旧工作台后台尚未退出，请通过启动器重新连接。') from None
     repo = Repository(Path(args.repo).expanduser().resolve())
     with RuntimeSession(repo.common) as runtime:
         # Serial request handling prevents this process from running concurrent merges.
         server = HTTPServer(("127.0.0.1", args.port), Handler)
+        server.restart_requested = False
         try:
             registry = ProjectRegistry()
             registered = registry.add(repo.root)
             repo.history = OperationHistory(history_file(Path(__file__).resolve().parent), repo.common)
-            server.repo, server.token, server.runtime = repo, secrets.token_urlsafe(32), runtime
+            server.repo, server.token, server.runtime = repo, restart_token or secrets.token_urlsafe(32), runtime
             server.projects = registry
             server.feishu_warning = ''
             try:
@@ -1491,6 +1677,18 @@ def main():
                 server.schedule.close()
             repo.resolver.close()
             server.server_close()
+    if server.restart_requested is True:
+        environment = os.environ.copy()
+        environment['BRANCH_DESK_RESTART_TOKEN'] = server.token
+        command = [sys.executable, '-X', 'utf8', str(Path(__file__).resolve()), '--repo', repo.root,
+                   '--port', str(server.server_port), '--no-browser']
+        try:
+            if platform.IS_WINDOWS:
+                subprocess.Popen(command, env=environment, **platform.child_options())
+            else:
+                os.execve(sys.executable, command, environment)
+        except OSError:
+            raise WorkbenchRuntimeError('工作台重启启动失败，请通过启动器重新启动并连接。') from None
 
 
 if __name__ == "__main__":

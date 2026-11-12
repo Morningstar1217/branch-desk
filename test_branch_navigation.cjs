@@ -6,7 +6,7 @@ const vm = require('node:vm');
 const read = name => fs.readFileSync(path.join(__dirname, 'web', name), 'utf8');
 const plain = value => JSON.parse(JSON.stringify(value));
 function fixture(pinned = null) {
-  const f = { calls: [], storage: new Map(), pinned, failPreferences: false, failTarget: false, projectStatus: 'running', focused: '', services: {}, moduleScroll: { scrollTop: 0 }, events: new Map() };
+  const f = { calls: [], handlers: {}, storage: new Map(), pinned, failPreferences: false, failTarget: false, projectStatus: 'running', focused: '', services: {}, moduleScroll: { scrollTop: 0 }, events: new Map() };
   const trees = ['master', 'M-2-需求乙', 'M-1-需求甲'].map(branch => ({ branch, name: branch, path: '/fixture/' + branch, ref: 'refs/heads/' + branch }));
   const uncreated = { branch: 'new', name: 'new', ref: 'refs/heads/new', path: '' };
   f.overview = { root: '/fixture', branches: [...trees, uncreated], worktrees: trees, refs: trees.map(({ ref, name }) => ({ ref, name })) };
@@ -22,7 +22,8 @@ function fixture(pinned = null) {
     async fetch(url, options) {
       const route = url.slice(5), data = options.body ? JSON.parse(options.body) : {}; f.calls.push({ route, data });
       let result;
-      if (route === 'overview') result = f.overview;
+      if (f.handlers[route]) result = await f.handlers[route](data);
+      else if (route === 'overview') result = f.overview;
       else if (route === 'preferences') {
         if (f.failPreferences) throw Error('preferences unavailable');
         if (options.method === 'POST') f.pinned = data.pinned;
@@ -76,7 +77,320 @@ function fixture(pinned = null) {
 }
 let checks = 0;
 async function check(name, fn) { const f = fixture(); try { await f.ready(); await fn(f); checks++; console.log('ok - ' + name); } finally { f.close(); } }
+function mergedCleanupFixture(f) {
+  const ui = f.ui, base = 'a'.repeat(40);
+  ui.bulkCleanupDialog.value = { open: false, showModal() { this.open = true; }, close() { this.open = false; } };
+  f.handlers['branch/merged/list'] = async () => ({ root: '/fixture', base_ref: 'refs/remotes/origin/master', base,
+    rows: f.trees.map((tree, index) => ({ ...tree, reason: index === 0 ? '环境分支保留' : '' })) });
+  f.handlers['branch/merged/preview'] = async data => {
+    const tree = f.trees.find(tree => tree.ref === data.ref);
+    return { plan: tree.ref + '-plan', ...tree, head: 'b'.repeat(40), root_path: '/fixture', base_ref: 'refs/remotes/origin/master', base,
+      force: data.discard_ignored, ignored: data.discard_ignored ? [{ path: 'node_modules/', kind: '目录', count: 3 }] : [], generated: [] };
+  };
+  f.handlers['branch/merged/delete'] = async data => {
+    const tree = f.trees.find(tree => tree.ref + '-plan' === data.plan);
+    return { branch: tree.branch, path: tree.path, head: 'b'.repeat(40), status: 'succeeded', released: true, deleted: true };
+  };
+  return ui;
+}
+async function unlinkFixture(f, count = 2) {
+  const ui = f.ui;
+  ui.projectSettings.value.feishu = { enabled: true, space_id: 'fixture-space' };
+  await f.settle();
+  const dialog = () => ({ open: false, showModal() { this.open = true; }, close() { this.open = false; } });
+  ui.quickDialog.value = dialog(); ui.unlinkDialog.value = dialog();
+  f.links = Object.fromEntries(Array.from({ length: count }, (_, index) => {
+    const id = String(1000 + index);
+    return [id, { branch_ref: 'refs/heads/deleted-' + id, thread_url: 'codex://threads/fixture-' + id }];
+  }));
+  f.handlers['task-links'] = async () => ({ items: plain(f.links), warning: '' });
+  f.handlers['task-links/unbind'] = async data => {
+    const results = data.items.map(item => {
+      const link = f.links[item.work_item_id];
+      if (link.branch_ref !== item.expected_ref || data.missing_only && f.overview.branches.some(row => row.ref === item.expected_ref)) {
+        return { work_item_id: item.work_item_id, status: 'skipped', error: '关联或分支已变化' };
+      }
+      link.unlinked_ref = link.branch_ref; link.branch_ref = ''; link.unlinked_at = 1234567890;
+      return { work_item_id: item.work_item_id, status: 'succeeded', error: '' };
+    });
+    return { results, items: plain(f.links), warning: '' };
+  };
+  return ui;
+}
 (async () => {
+  await check('unified refresh fetches before reading the list and internal refresh remains local', async f => {
+    const ui = f.ui;
+    await ui.refresh(); assert(!f.calls.some(call => call.route === 'fetch'));
+    f.calls.length = 0; f.handlers.fetch = async () => ({});
+    ui.plan.value = { plan: 'old-preview' };
+    await ui.fetchRemote();
+    assert.equal(f.calls[0].route, 'fetch'); assert.equal(f.calls[1].route, 'overview');
+    assert.equal(ui.plan.value, null); assert(ui.fetchedAt.value); assert.match(ui.message.value, /远端引用和列表已刷新/);
+    const html = read('index.html');
+    assert.equal((html.match(/@click="fetchRemote"/g) || []).length, 1);
+    assert.match(html, /@click="fetchRemote"[^>]*>刷新<\/button>/);
+    assert.match(html, /@click="restartWorkbench"[^>]*>重启当前工作台<\/button>/);
+    assert.doesNotMatch(html, />刷新远端引用<\/button>|>刷新列表<\/button>/);
+  });
+  await check('refresh always attempts the list read, retains both errors and never retries or stamps a failed fetch', async f => {
+    const ui = f.ui; ui.fetchedAt.value = 'previous';
+    f.handlers.fetch = async () => { throw Error('origin unavailable'); };
+    f.handlers.overview = async () => { throw Error('overview unavailable'); };
+    await ui.fetchRemote();
+    assert.deepEqual(f.calls.map(call => call.route), ['fetch', 'overview']);
+    assert.match(ui.error.value, /origin unavailable/); assert.match(ui.error.value, /overview unavailable/);
+    assert.equal(ui.fetchedAt.value, 'previous'); assert.equal(ui.overview.value.root, '/fixture');
+    f.calls.length = 0; ui.busy.value = true; await ui.fetchRemote(); assert.equal(f.calls.length, 0); ui.busy.value = false;
+    f.handlers.fetch = async () => ({}); await ui.fetchRemote();
+    assert.notEqual(ui.fetchedAt.value, 'previous'); assert.match(ui.error.value, /overview unavailable/);
+  });
+  await check('restart requires confirmation and reloads only after the same project has a new runtime identity', async f => {
+    const ui = f.ui, original = { identity: 'a'.repeat(32), common: '/fixture/.git', app: '/workbench', pid: 123 };
+    let restarted = false, reloads = 0;
+    f.context.location.reload = () => { reloads++; };
+    f.handlers.runtime = async () => ({ ...original, identity: (restarted ? 'b' : 'a').repeat(32) });
+    f.handlers['runtime/restart'] = async data => {
+      assert.deepEqual(data, { confirmed: true, expected_identity: original.identity });
+      restarted = true; return { status: 'restarting' };
+    };
+    const cancelled = ui.restartWorkbench(); await f.settle();
+    assert.equal(ui.confirmation.value.title, '重启当前工作台？');
+    assert(!f.calls.some(call => call.route === 'runtime/restart'));
+    ui.finishConfirmation(false); await cancelled; assert.equal(reloads, 0);
+    const accepted = ui.restartWorkbench(); await f.settle(); ui.finishConfirmation(true); await accepted;
+    assert.equal(f.calls.filter(call => call.route === 'runtime/restart').length, 1);
+    assert.equal(reloads, 1); assert.equal(ui.busy.value, false);
+  });
+  await check('restart waits through old and unavailable runtime probes, then stops on timeout without replaying the request', async f => {
+    const ui = f.ui, original = { identity: 'a'.repeat(32), common: '/fixture/.git', app: '/workbench' };
+    let clock = 0, probes = 0, reloads = 0, accepted = false;
+    f.context.Date = class extends Date { static now() { return clock; } };
+    f.context.location.reload = () => { reloads++; };
+    f.context.setTimeout = (callback, ms) => {
+      if (ms === 400) { clock += ms; Promise.resolve().then(callback); }
+      return 0;
+    };
+    f.handlers.runtime = async () => {
+      if (accepted) { probes++; if (probes % 2 === 0) throw Error('connecting'); }
+      return original;
+    };
+    f.handlers['runtime/restart'] = async () => { accepted = true; return { status: 'restarting' }; };
+    const result = ui.restartWorkbench(); await f.settle(); ui.finishConfirmation(true); await result;
+    assert.match(ui.error.value, /重启超时/); assert.equal(reloads, 0); assert(probes > 1);
+    assert.equal(f.calls.filter(call => call.route === 'runtime/restart').length, 1);
+    assert.equal(ui.busy.value, false);
+  });
+  await check('pending edits and previews block restart, and mismatched projects or old backends never reload', async f => {
+    const ui = f.ui, original = { identity: 'a'.repeat(32), common: '/fixture/.git', app: '/workbench' };
+    let reloads = 0, current = original;
+    f.context.location.reload = () => { reloads++; };
+    f.handlers.runtime = async () => current;
+    ui.plan.value = { plan: 'pending' }; await ui.restartWorkbench(); assert.equal(f.calls.length, 0); ui.plan.value = null;
+    ui.scheduleDirty.value = true; await ui.restartWorkbench(); assert.equal(f.calls.length, 0); ui.scheduleDirty.value = false;
+    f.handlers['runtime/restart'] = async () => {
+      current = { ...original, identity: 'b'.repeat(32), common: '/other/.git' }; return { status: 'restarting' };
+    };
+    const mismatch = ui.restartWorkbench(); await f.settle(); ui.finishConfirmation(true); await mismatch;
+    assert.match(ui.error.value, /身份不匹配/); assert.equal(reloads, 0);
+    current = original; f.handlers['runtime/restart'] = async () => { throw Error('接口不存在'); };
+    const oldBackend = ui.restartWorkbench(); await f.settle(); ui.finishConfirmation(true); await oldBackend;
+    assert.match(ui.error.value, /通过启动器重启一次/); assert.equal(reloads, 0);
+    assert.equal(f.calls.filter(call => call.route === 'runtime/restart').length, 2);
+  });
+  await check('delivered-link selection covers more than sixty rows, previews without writes, then refreshes remaining attention', async f => {
+    const ui = await unlinkFixture(f, 72);
+    f.links['999'] = { branch_ref: f.trees[1].ref };
+    f.snapshotOverrides = { conflicts: ['src/conflict.js'] };
+    await ui.openUnlink();
+    assert.equal(ui.unlinkRows.value.length, 72);
+    ui.selectVisibleUnlinks(); assert.equal(ui.unlinkSelected.value.length, 72);
+    ui.unlinkSearch.value = 'deleted-1000'; assert.equal(ui.unlinkVisible.value.length, 1);
+    await ui.previewUnlink(); assert.equal(ui.unlinkPreview.value.rows.length, 72);
+    assert.equal(f.calls.filter(call => call.route === 'task-links/unbind').length, 0);
+    ui.resetUnlinkPreview(); assert.equal(ui.unlinkSelected.value.length, 72);
+    await ui.previewUnlink(); await ui.executeUnlink();
+    assert.equal(ui.unlinkResults.value.filter(row => row.status === 'succeeded').length, 72);
+    assert.equal(f.links['1000'].thread_url, 'codex://threads/fixture-1000');
+    assert.equal(f.links['999'].branch_ref, f.trees[1].ref);
+    assert.equal(ui.attentionItems.value.filter(row => row.key.startsWith('association:')).length, 0);
+    assert.equal(ui.attentionItems.value.filter(row => row.key.startsWith('conflict:')).length, 3);
+    const writes = f.calls.filter(call => call.route === 'task-links/unbind');
+    assert.equal(writes.length, 1); assert.equal(writes[0].data.space_id, 'fixture-space');
+    assert.equal(writes[0].data.missing_only, true); assert.equal(writes[0].data.confirmed, true);
+    await ui.executeUnlink(); assert.equal(f.calls.filter(call => call.route === 'task-links/unbind').length, 1);
+  });
+  await check('unlink preview detects changed links and execution skips changes after preview', async f => {
+    const ui = await unlinkFixture(f);
+    await ui.openUnlink(); ui.selectVisibleUnlinks();
+    f.links['1000'].branch_ref = 'refs/heads/rebound';
+    await ui.previewUnlink(); assert.equal(ui.unlinkPreview.value, null);
+    assert.match(ui.unlinkIssue.value, /已变化/);
+    await ui.openUnlink(); ui.selectVisibleUnlinks(); await ui.previewUnlink();
+    f.overview.branches.push({ ref: 'refs/heads/rebound', branch: 'rebound', name: 'rebound', path: '' });
+    f.links['1000'].unlinked_at = 1234;
+    await ui.executeUnlink();
+    assert.deepEqual(plain(ui.unlinkResults.value.map(row => row.status)), ['skipped', 'succeeded']);
+    assert.equal(ui.unlinkResults.value[0].unlinked_at, null);
+    assert.equal(f.links['1000'].branch_ref, 'refs/heads/rebound');
+  });
+  await check('unlink timeout consumes its confirmation and rereads actual remaining links without automatic replay', async f => {
+    const ui = await unlinkFixture(f);
+    await ui.openUnlink(); ui.selectVisibleUnlinks(); await ui.previewUnlink();
+    f.handlers['task-links/unbind'] = async () => { f.links['1000'].branch_ref = ''; throw Error('timeout'); };
+    await ui.executeUnlink();
+    assert.equal(ui.unlinkPreview.value, null); assert.match(ui.unlinkIssue.value, /timeout/);
+    assert(ui.unlinkResults.value.every(row => row.status === 'unconfirmed'));
+    await ui.executeUnlink(); assert.equal(f.calls.filter(call => call.route === 'task-links/unbind').length, 1);
+    await ui.openUnlink(); assert.deepEqual(plain(ui.unlinkRows.value.map(row => row.work_item_id)), ['1001']);
+    ui.selectVisibleUnlinks(); await ui.previewUnlink();
+    ui.projectSettings.value.feishu = { enabled: true, space_id: 'changed-space' }; await f.settle();
+    assert.equal(ui.unlinkDialog.value.open, false);
+    await ui.executeUnlink(); assert.equal(f.calls.filter(call => call.route === 'task-links/unbind').length, 1);
+  });
+  await check('cleanup synchronizes only explicitly selected associations and keeps Git success on metadata failure', async f => {
+    const ui = mergedCleanupFixture(f); await unlinkFixture(f);
+    f.links['1000'].branch_ref = f.trees[1].ref; f.links['1001'].branch_ref = f.trees[2].ref;
+    await ui.openBulkCleanup('merged'); ui.selectAllBulkCleanup(); await ui.previewBulkCleanup();
+    assert.equal(ui.bulkCleanupLinks.value.length, 2); assert.equal(ui.bulkCleanupUnlink.value, false);
+    ui.bulkCleanupUnlink.value = true;
+    const unbind = f.handlers['task-links/unbind'];
+    f.handlers['task-links/unbind'] = async data => {
+      if (data.items[0].work_item_id === '1001') throw Error('storage failure');
+      return unbind(data);
+    };
+    await ui.executeBulkCleanup();
+    assert.deepEqual(plain(ui.bulkCleanupResults.value.map(row => row.status)), ['succeeded', 'succeeded']);
+    assert.equal(ui.bulkCleanupResults.value[0].unlinked, 1);
+    assert.match(ui.bulkCleanupResults.value[1].linkError, /storage failure/);
+    assert.equal(f.links['1001'].branch_ref, f.trees[2].ref);
+    assert(f.calls.filter(call => call.route === 'task-links/unbind').every(call => call.data.missing_only === false));
+  });
+  await check('cleanup leaves associations alone when unchecked and stops before Git writes after a selected link changes', async f => {
+    const ui = mergedCleanupFixture(f); await unlinkFixture(f, 1);
+    f.links['1000'].branch_ref = f.trees[1].ref;
+    await ui.openBulkCleanup('merged'); ui.bulkCleanupSelected.value = [f.trees[1].ref]; await ui.previewBulkCleanup();
+    await ui.executeBulkCleanup(); assert.equal(f.calls.filter(call => call.route === 'task-links/unbind').length, 0);
+    await ui.openBulkCleanup('merged'); ui.bulkCleanupSelected.value = [f.trees[1].ref]; await ui.previewBulkCleanup();
+    ui.bulkCleanupUnlink.value = true; f.links['1000'].branch_ref = f.trees[2].ref;
+    const writes = f.calls.filter(call => call.route === 'branch/merged/delete').length;
+    await ui.executeBulkCleanup(); assert.equal(f.calls.filter(call => call.route === 'branch/merged/delete').length, writes);
+    assert.equal(ui.bulkCleanupResults.value[0].status, 'failed');
+    f.handlers['task-links'] = async () => { throw Error('metadata unavailable'); };
+    await ui.openBulkCleanup('merged'); ui.bulkCleanupSelected.value = [f.trees[1].ref]; await ui.previewBulkCleanup();
+    assert.equal(ui.bulkCleanupReady.value, true); assert.match(ui.bulkCleanupLinksIssue.value, /metadata unavailable/);
+    assert.equal(ui.bulkCleanupUnlink.value, false);
+    await ui.executeBulkCleanup(); assert.equal(ui.bulkCleanupResults.value[0].status, 'succeeded');
+  });
+  await check('delivered-link dialog template compiles selection, preview, result and empty states', async f => {
+    const ui = await unlinkFixture(f, 1), errors = [];
+    const template = read('index.html').match(/<dialog ref="unlinkDialog"[\s\S]*?<\/dialog>/)[0];
+    const render = f.vue.compile(template, { decodeEntities: value => value, onError: error => errors.push(error.message) });
+    await ui.openUnlink(); render(f.vue.proxyRefs(ui), []);
+    ui.selectVisibleUnlinks(); await ui.previewUnlink(); render(f.vue.proxyRefs(ui), []);
+    await ui.executeUnlink(); render(f.vue.proxyRefs(ui), []);
+    await ui.openUnlink(); render(f.vue.proxyRefs(ui), []);
+    assert.deepEqual(errors, []); assert.equal(ui.unlinkRows.value.length, 0);
+  });
+  await check('merged cleanup lists protected branches, previews without writes, then releases and deletes only confirmed selections', async f => {
+    const ui = mergedCleanupFixture(f);
+    await ui.openBulkCleanup('merged');
+    assert.equal(ui.bulkCleanupTitle.value, '删除已合并的分支');
+    assert.deepEqual(f.calls.map(call => call.route), ['branch/merged/list']);
+    ui.selectAllBulkCleanup();
+    assert.deepEqual(plain(ui.bulkCleanupSelected.value), f.trees.slice(1).map(tree => tree.ref));
+    await ui.previewBulkCleanup();
+    assert.equal(ui.bulkCleanupReady.value, true);
+    assert.equal(f.calls.filter(call => call.route.endsWith('/delete')).length, 0);
+    await ui.executeBulkCleanup();
+    assert.deepEqual(plain(ui.bulkCleanupResults.value.map(row => row.status)), ['succeeded', 'succeeded']);
+    const writes = f.calls.filter(call => call.route === 'branch/merged/delete');
+    assert.equal(writes.length, 2);
+    assert(writes.every(call => call.data.confirmation === true && call.data.discard_confirmation === false));
+    assert(!f.calls.some(call => ['worktree/release', 'branch/delete'].includes(call.route)));
+    const count = f.calls.length;
+    await ui.executeBulkCleanup(); assert.equal(f.calls.length, count, 'Completed plans cannot be replayed');
+  });
+  await check('ignored files are listed in a cancellable second confirmation and never deleted after cancellation', async f => {
+    const ui = mergedCleanupFixture(f);
+    await ui.openBulkCleanup('merged', [], true);
+    ui.bulkCleanupSelected.value = [f.trees[1].ref];
+    await ui.previewBulkCleanup();
+    const cancel = ui.executeBulkCleanup(); await f.settle();
+    assert.match(ui.confirmation.value.message, /node_modules\/.*目录.*3 项/s);
+    assert.match(ui.confirmation.value.message, /移除目录：\/fixture/);
+    ui.finishConfirmation(false); await cancel;
+    assert.equal(f.calls.filter(call => call.route.endsWith('/delete')).length, 0);
+    assert.equal(ui.bulkCleanupReady.value, true);
+    const confirm = ui.executeBulkCleanup(); await f.settle(); ui.finishConfirmation(true); await confirm;
+    assert.equal(f.calls.find(call => call.route === 'branch/merged/delete').data.discard_confirmation, true);
+  });
+  await check('merged cleanup stops on partial failure and preserves the completed release result', async f => {
+    const ui = mergedCleanupFixture(f);
+    f.handlers['branch/merged/delete'] = async () => ({ branch: f.trees[1].branch, released: true, deleted: false, status: 'failed', error: '分支锁定' });
+    await ui.openBulkCleanup('merged'); ui.selectAllBulkCleanup(); await ui.previewBulkCleanup(); await ui.executeBulkCleanup();
+    assert.deepEqual(plain(ui.bulkCleanupResults.value.map(row => row.status)), ['failed', 'pending']);
+    assert.equal(ui.bulkCleanupResults.value[0].released, true);
+    assert.match(ui.bulkCleanupResults.value[0].error, /分支锁定/);
+    assert.equal(f.calls.filter(call => call.route.endsWith('/delete')).length, 1);
+    assert.match(ui.bulkCleanupIssue.value, /停止后续项/);
+  });
+  await check('changed baseline and failed reads prevent merged cleanup execution', async f => {
+    const ui = mergedCleanupFixture(f), preview = f.handlers['branch/merged/preview'];
+    await ui.openBulkCleanup('merged'); ui.selectAllBulkCleanup();
+    f.handlers['branch/merged/preview'] = async data => ({ ...await preview(data), base: 'c'.repeat(40) });
+    await ui.previewBulkCleanup(); assert.equal(ui.bulkCleanupReady.value, false);
+    await ui.executeBulkCleanup(); assert(!f.calls.some(call => call.route.endsWith('/delete')));
+    ui.closeBulkCleanup(); f.handlers['branch/merged/list'] = async () => { throw Error('接口不存在'); };
+    await ui.openBulkCleanup('merged'); assert.match(ui.bulkCleanupIssue.value, /重启/); assert.equal(ui.bulkCleanupRows.value.length, 0);
+  });
+  await check('the current review worktree remains excluded from merged cleanup selection', async f => {
+    const ui = mergedCleanupFixture(f);
+    await ui.enterReview(f.trees[1]);
+    await ui.openBulkCleanup('merged');
+    assert.match(ui.bulkCleanupRows.value.find(row => row.ref === f.trees[1].ref).reason, /当前审查工作区/);
+    ui.selectAllBulkCleanup();
+    assert.deepEqual(plain(ui.bulkCleanupSelected.value), [f.trees[2].ref]);
+  });
+  await check('merged cleanup template compiles and exposes the entry, ignore list, protected reasons and partial results', async f => {
+    const ui = mergedCleanupFixture(f), html = read('index.html');
+    const template = html.slice(html.indexOf('<dialog ref="bulkCleanupDialog"'), html.indexOf('<dialog ref="releaseDialog"'));
+    const errors = [];
+    const render = f.vue.compile(template, { decodeEntities: value => value, onError: error => errors.push(error.message) });
+    assert.deepEqual(errors, []);
+    function text(node) { return typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' ? text(node.children) : ''; }
+    await ui.openBulkCleanup('merged');
+    assert.match(text(render(f.vue.proxyRefs(ui), [])), /环境分支保留/);
+    ui.bulkCleanupSelected.value = [f.trees[1].ref]; await ui.previewBulkCleanup();
+    assert.match(text(render(f.vue.proxyRefs(ui), [])), /确认释放并删除本地分支/);
+    assert.match(html, /@click="openBulkCleanup\('merged'\)"[^>]*>删除已合并的分支/);
+  });
+  await check('existing ordinary bulk release and delete retain their separate preview and execution routes', async f => {
+    const ui = mergedCleanupFixture(f);
+    assert.doesNotMatch(read('index.html'), /清理候选|cleanupDialog|scanCleanup/);
+    assert.equal(ui.scanCleanup, undefined);
+    assert.equal(ui.checkCleanup, undefined);
+    f.handlers['worktree/release/preview'] = async data => {
+      const tree = f.trees.find(tree => tree.path === data.path);
+      return { ...tree, plan: tree.ref + '-plan', head: 'abc', force: false, generated: [] };
+    };
+    f.handlers['worktree/release'] = async data => {
+      const tree = f.trees.find(tree => tree.ref + '-plan' === data.plan);
+      return { branch: tree.branch, path: tree.path, head: 'abc' };
+    };
+    await ui.openBulkCleanup('release'); ui.selectAllBulkCleanup(); await ui.previewBulkCleanup();
+    assert.equal(ui.bulkCleanupReady.value, true); await ui.executeBulkCleanup();
+    assert.equal(f.calls.filter(call => call.route === 'worktree/release').length, 2);
+    assert(ui.bulkCleanupResults.value.every(row => row.status === 'succeeded'));
+    ui.closeBulkCleanup(); f.calls.length = 0;
+    f.handlers['branch/delete/preview'] = async data => ({ ...f.uncreated, plan: 'delete-plan', ref: data.ref, head: 'abc',
+      base: 'abc', base_ref: 'origin/new', upstream: 'origin/new', root_head: 'root', root_branch: 'master', root_path: '/fixture', force: false });
+    f.handlers['branch/delete'] = async () => ({ branch: f.uncreated.branch });
+    await ui.openBulkCleanup('delete'); ui.selectAllBulkCleanup(); await ui.previewBulkCleanup(); await ui.executeBulkCleanup();
+    assert.equal(f.calls.filter(call => call.route === 'branch/delete/preview').length, 2, 'Existing deletion renews a one-use preview after config changes');
+    assert.equal(f.calls.filter(call => call.route === 'branch/delete').length, 1);
+    assert.equal(ui.bulkCleanupResults.value[0].status, 'succeeded');
+    assert(!f.calls.some(call => call.route.startsWith('branch/merged/')));
+  });
   for (const file of ['index.html', 'app.js', 'schedule.js', 'batch.js']) {
     assert(!/<select\b/i.test(read(file)), `${file}: selection controls must use the workbench UI, not an OS-native popup`);
   }
@@ -374,6 +688,20 @@ async function check(name, fn) { const f = fixture(); try { await f.ready(); awa
   });
   await check('quick navigation, schedule links and saved review reach the dedicated review area', async f => {
     const ui = f.ui;
+    const template = read('index.html').match(/<div class="quick-footer">[\s\S]*?<\/dialog>/)[0].replace(/<\/dialog>$/, '');
+    const render = f.vue.compile(template, { decodeEntities: value => value });
+    for (const mode of ['attention', 'search']) {
+      for (const locked of [false, true]) {
+        const footer = render(f.vue.proxyRefs({ ...ui, quickMode: mode, feishuEnabled: true,
+          attentionBusy: locked, quickBusy: locked, navigationLocked: false }), []);
+        const actions = footer.children.find(child => child.props?.class === 'quick-footer-actions');
+        assert(actions, 'Footer buttons share a right-aligned action group');
+        assert(!footer.children.some(child => child.type === 'button'));
+        const buttons = actions.children.filter(child => child.type === 'button');
+        assert.equal(buttons.length, mode === 'attention' ? 2 : 1);
+        assert(buttons.every(button => button.props.disabled === locked));
+      }
+    }
     await ui.navigateBranch(f.trees[1].ref); assert.equal(ui.mergePane.value, 'review');
     await ui.returnToOverview(); await ui.openTaskBranch({ work_item_id: '1', ref: f.trees[1].ref, title: '关联需求' });
     assert.equal(ui.mergePane.value, 'review'); assert.equal(ui.activeTask.value.title, '关联需求');

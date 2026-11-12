@@ -90,6 +90,14 @@ createApp({
     const quickBusy = ref(false), quickError = ref(''), quickLinks = ref({}), quickJobs = ref({}), quickOverview = ref(null);
     const attentionItems = ref([]), attentionBusy = ref(false), attentionError = ref(''), attentionProgress = ref('');
     const attentionChecked = ref(''), attentionStale = ref(true);
+    const unlinkDialog = ref(null), unlinkRows = ref([]), unlinkSelected = ref([]), unlinkSearch = ref('');
+    const unlinkPreview = ref(null), unlinkResults = ref([]), unlinkIssue = ref('');
+    const unlinkVisible = computed(() => unlinkRows.value.filter(row =>
+      `${row.title} ${row.work_item_id} ${row.expected_ref}`.toLowerCase().includes(unlinkSearch.value.trim().toLowerCase())));
+    const unlinkStatus = status => ({ succeeded: '已解除', skipped: '已跳过', failed: '失败', unconfirmed: '待核对' })[status] || status;
+    let unlinkRoot = '', unlinkSpace = '';
+    function resetUnlinkPreview() { unlinkPreview.value = null; unlinkResults.value = []; unlinkIssue.value = ''; }
+    watch(unlinkSelected, resetUnlinkPreview, { deep: true, flush: 'sync' });
     let quickVersion = 0, attentionVersion = 0, navigationStopped = false;
     const overview = ref({ root: '', worktrees: [], refs: [], branches: [] });
     const services = ref({}), servicesLoading = ref(false), servicesWarning = ref('');
@@ -204,17 +212,23 @@ createApp({
       stageFiles.value = checked ? [...selectableStageFiles.value] : [];
     }
     const busySeconds = ref(0), lastAction = ref(null);
-    const cleanupDialog = ref(null), cleanupRows = ref([]), cleanupSkipped = ref([]), cleanupProgress = ref('');
     const bulkCleanupDialog = ref(null), bulkCleanupMode = ref('release'), bulkCleanupRows = ref([]), bulkCleanupSelected = ref([]);
     const bulkCleanupSearch = ref(''), bulkCleanupPreview = ref(null), bulkCleanupResults = ref([]), bulkCleanupIssue = ref('');
-    const bulkCleanupTitle = computed(() => bulkCleanupMode.value === 'release' ? '批量释放 worktree' : '批量删除本地分支');
+    const bulkCleanupDiscardIgnored = ref(false), bulkCleanupBase = ref(null);
+    const bulkCleanupUnlink = ref(false), bulkCleanupLinksIssue = ref('');
+    const bulkCleanupLinks = computed(() => (bulkCleanupPreview.value || []).flatMap(row => row.links || []));
+    let bulkCleanupLinkSpace = '';
+    const bulkCleanupTitle = computed(() => ({ release: '批量释放 worktree', delete: '批量删除本地分支', merged: '删除已合并的分支' })[bulkCleanupMode.value]);
     const bulkCleanupVisible = computed(() => bulkCleanupRows.value.filter(row =>
       `${row.branch} ${row.path || ''}`.toLowerCase().includes(bulkCleanupSearch.value.trim().toLowerCase())));
     const bulkCleanupEligible = computed(() => bulkCleanupVisible.value.filter(row => !row.reason));
     const bulkCleanupReady = computed(() => bulkCleanupPreview.value?.length > 0 && bulkCleanupPreview.value.every(row => row.preview && !row.error));
     const bulkCleanupStatus = status => ({ pending: '未执行', running: '执行中', succeeded: '已完成', failed: '失败 / 待核对' })[status] || status;
     let bulkCleanupRoot = '';
-    function resetBulkCleanupPreview() { bulkCleanupPreview.value = null; bulkCleanupResults.value = []; bulkCleanupIssue.value = ''; }
+    function resetBulkCleanupPreview() {
+      bulkCleanupPreview.value = null; bulkCleanupResults.value = []; bulkCleanupIssue.value = '';
+      bulkCleanupUnlink.value = false; bulkCleanupLinksIssue.value = ''; bulkCleanupLinkSpace = '';
+    }
     watch(bulkCleanupSelected, resetBulkCleanupPreview, { deep: true, flush: 'sync' });
     let activityTimer;
     const resolution = computed(() => {
@@ -381,6 +395,53 @@ createApp({
     function reloadWorkbench() {
       if (!availableBuild.value || reloadLocked.value || document.querySelector('dialog[open]')) return;
       location.reload();
+    }
+    async function waitForRestart(previous) {
+      const deadline = Date.now() + 30000;
+      while (!navigationStopped && Date.now() < deadline) {
+        const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 3000);
+        let current = null;
+        try { current = await api('runtime', {}, controller.signal); }
+        catch { /* Read-only probes bridge the short gap while the backend reloads. */ }
+        finally { clearTimeout(timeout); }
+        if (current) {
+          if (current.common !== previous.common || current.app !== previous.app) {
+            throw new Error('重新连接的工作台身份不匹配，请重新选择项目。');
+          }
+          if (typeof current.identity === 'string' && /^[\w-]{32}$/.test(current.identity) && current.identity !== previous.identity) return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 400));
+      }
+      throw new Error('等待工作台重启超时，请重新连接工作台核对后台状态。');
+    }
+    async function restartWorkbench() {
+      if (projectSwitchLocked.value || !overview.value.root || document.querySelector('dialog[open]')) return;
+      const root = overview.value.root;
+      let previous = null;
+      await run('读取当前工作台实例', async () => {
+        previous = await navigationRead('runtime');
+        if (!previous || !/^[\w-]{32}$/.test(previous.identity) || !previous.common || !previous.app) {
+          previous = null;
+          throw new Error('工作台实例信息不完整，请重新连接后重试。');
+        }
+      });
+      if (!previous || projectSwitchLocked.value || root !== overview.value.root) return;
+      if (!await confirmAction({ title: '重启当前工作台？', confirmLabel: '确认重启',
+        message: `${root}\n\n将重新加载当前项目的 Branch Desk 后台和页面。前后端开发服务继续运行。` })) return;
+      if (projectSwitchLocked.value || root !== overview.value.root) return;
+      await run('重启当前工作台', async () => {
+        saveWorkspace();
+        let result;
+        try { result = await api('runtime/restart', { confirmed: true, expected_identity: previous.identity }); }
+        catch (e) {
+          if (/接口不存在|404/.test(e.message)) throw new Error('当前后台需先通过启动器重启一次，以启用快速重启入口。');
+          throw e;
+        }
+        if (result.status !== 'restarting') throw new Error('重启请求结果未确认，请重新连接后核对。');
+        busyLabel.value = '等待工作台重新连接';
+        await waitForRestart(previous);
+        if (!navigationStopped && root === overview.value.root) location.reload();
+      });
     }
     const operationLock = computed(() => busy.value ? busyLabel.value + '进行中' : batchRunning.value ? '批量任务正在执行' : resolving.value ? (resolution.value?.kind==='repair' ? '等待 Codex 修复结束' : '等待 Codex 冲突处理结束') : '');
     const mergeReason = computed(() => operationLock.value || (resolutionPreview.value ? '请先完成或取消冲突修复检查' : commitPreview.value ? '请先完成或取消提交预览' : pushPreview.value ? '请先完成或取消推送预览' : '') || state.value?.blocked || (!source.value ? '请先选择来源分支' : ''));
@@ -931,6 +992,92 @@ createApp({
       finally { if (version === attentionVersion) { attentionBusy.value = false; attentionProgress.value = ''; } }
     }
     function quickClosed() { ++quickVersion; quickBusy.value = false; }
+    const taskLinkSpace = () => projectSettings.value.feishu?.space_id || overview.value.project?.space_id || '';
+    const taskLinkTitle = id => scheduleTasks.value.find(row => row.work_item_id === id)?.name || '需求 ' + id;
+    function closeUnlink() {
+      if (busy.value) return;
+      resetUnlinkPreview(); unlinkDialog.value?.close();
+    }
+    function selectVisibleUnlinks() {
+      if (navigationLocked.value) return;
+      if (unlinkVisible.value.length > 100) { unlinkIssue.value = '每批最多 100 项，请缩小搜索范围或手动勾选。'; return; }
+      unlinkSelected.value = unlinkVisible.value.map(row => row.work_item_id);
+    }
+    async function readUnlinkSnapshot(root, space) {
+      const [latest, links] = await Promise.all([navigationRead('overview'), navigationRead('task-links')]);
+      if (navigationStopped || overview.value.root !== root || latest.root !== root || !space || taskLinkSpace() !== space) {
+        throw new Error('项目或飞书空间已变化，请关闭后重新打开。');
+      }
+      if (links.warning) throw new Error(links.warning);
+      return { latest, links: links.items };
+    }
+    async function openUnlink(keepSearch = false) {
+      if (navigationLocked.value || attentionBusy.value || !feishuEnabled.value) return;
+      closeQuick();
+      unlinkSelected.value = []; unlinkRows.value = [];
+      if (keepSearch !== true) unlinkSearch.value = quickSearch.value;
+      resetUnlinkPreview(); unlinkRoot = overview.value.root; unlinkSpace = taskLinkSpace();
+      unlinkDialog.value.showModal();
+      await run('读取失效需求关联', async () => {
+        try {
+          const { latest, links } = await readUnlinkSnapshot(unlinkRoot, unlinkSpace);
+          const localRefs = new Set(latest.branches.filter(row => row.ref.startsWith('refs/heads/')).map(row => row.ref));
+          unlinkRows.value = Object.entries(links).filter(([, link]) => link.branch_ref?.startsWith('refs/heads/') &&
+            link.branch_ref !== 'refs/heads/master' && !localRefs.has(link.branch_ref)).map(([id, link]) => ({
+            work_item_id: id, title: taskLinkTitle(id), expected_ref: link.branch_ref
+          }));
+        } catch (e) { unlinkIssue.value = e.message; }
+      });
+    }
+    async function previewUnlink() {
+      if (navigationLocked.value) return;
+      resetUnlinkPreview();
+      const selected = [...unlinkSelected.value];
+      if (!selected.length || selected.length > 100 || new Set(selected).size !== selected.length) return;
+      await run('预览解除需求关联', async () => {
+        try {
+          const { latest, links } = await readUnlinkSnapshot(unlinkRoot, unlinkSpace);
+          const rows = selected.map(id => unlinkRows.value.find(row => row.work_item_id === id));
+          if (rows.some(row => !row || links[row.work_item_id]?.branch_ref !== row.expected_ref ||
+              latest.branches.some(branch => branch.ref === row.expected_ref))) {
+            throw new Error('所选关联或本地分支已变化，请重新读取并选择。');
+          }
+          unlinkPreview.value = { root: unlinkRoot, space_id: unlinkSpace, rows };
+        } catch (e) { unlinkIssue.value = e.message; }
+      });
+    }
+    async function executeUnlink() {
+      const preview = unlinkPreview.value;
+      if (navigationLocked.value || !preview) return;
+      if (preview.root !== overview.value.root || preview.space_id !== taskLinkSpace() ||
+          JSON.stringify(preview.rows.map(row => row.work_item_id)) !== JSON.stringify(unlinkSelected.value)) {
+        resetUnlinkPreview(); unlinkIssue.value = '项目、空间或选择已变化，请重新预览。'; return;
+      }
+      await run('批量解除已交付需求关联', async () => {
+        unlinkPreview.value = null; unlinkIssue.value = '';
+        unlinkResults.value = preview.rows.map(row => ({ ...row, status: 'unconfirmed', error: '正在核对处理结果…' }));
+        try {
+          const value = await api('task-links/unbind', { space_id: preview.space_id, confirmed: true, missing_only: true,
+            items: preview.rows.map(row => ({ work_item_id: row.work_item_id, expected_ref: row.expected_ref })) });
+          if (navigationStopped || preview.root !== overview.value.root || preview.space_id !== taskLinkSpace()) return;
+          if (!Array.isArray(value.results) || value.results.length !== preview.rows.length ||
+              value.results.some((row, index) => row.work_item_id !== preview.rows[index].work_item_id ||
+                !['succeeded', 'skipped', 'failed'].includes(row.status))) {
+            throw new Error('解除结果不完整，请重新读取并核对。');
+          }
+          unlinkResults.value = preview.rows.map((row, index) => ({ ...row, ...value.results[index],
+            unlinked_at: value.results[index].status === 'succeeded' ? value.items?.[row.work_item_id]?.unlinked_at : null }));
+          quickLinks.value = value.items;
+          unlinkIssue.value = value.warning || '';
+          await schedulePanel.value?.readLinks?.();
+        } catch (e) {
+          const issue = /接口不存在|404/.test(e.message) ? '当前后台尚未支持批量解除关联，请重启 Branch Desk 后台并重新连接' : e.message;
+          unlinkIssue.value = issue + '。请重新读取后核对，已确认的结果会保留。';
+          unlinkResults.value.forEach(row => { row.error = '写入结果待核对，请重新读取。'; });
+        }
+      });
+      await scanAttention();
+    }
     function closeQuick() { quickClosed(); quickDialog.value?.close(); }
     async function openQuick(mode = 'search') {
       if (navigationLocked.value || !overview.value.root || document.querySelector('dialog[open]')) return;
@@ -1157,36 +1304,6 @@ createApp({
         catch (e) { releaseIssue.value = e.message; throw e; }
       });
     }
-    function scanCleanup() {
-      if (serviceBusy.value || busy.value || batchRunning.value || resolving.value) return;
-      cleanupRows.value = []; cleanupSkipped.value = []; cleanupProgress.value = '';
-      if (!cleanupDialog.value.open) cleanupDialog.value.showModal();
-      return run('初筛工作区清理候选', async () => {
-        const development = await api('development/status');
-        if (Object.values(development).some(item => item.status === 'running')) throw new Error('需求读取任务正在运行，请结束后再检查清理候选。');
-        const latest = await api('overview');
-        if (latest.root !== overview.value.root) throw new Error('仓库已变化，请刷新后重新检查。');
-        for (const [index, tree] of latest.worktrees.entries()) {
-          cleanupProgress.value = `${index + 1} / ${latest.worktrees.length}`;
-          let reason = tree.path === latest.root ? '启动工作区' : tree.path === path.value ? '当前选择的工作区' :
-            !tree.branch || tree.branch === 'master' ? '受保护分支或分离 HEAD' : tree.missing || tree.locked || tree.prunable ? '目录缺失、锁定或登记异常' :
-              preferences.value.pinned.includes('refs/heads/' + tree.branch) ? '常用目标' : '';
-          if (!reason) {
-            try {
-              const current = await api('status', { path: tree.path });
-              reason = current.path !== tree.path || current.branch !== tree.branch ? '工作区分支已变化' :
-                current.resolution?.status === 'running' ? '正在处理冲突' : current.status || current.operations?.length ? '存在本地改动或 Git 操作' : '';
-            } catch (e) { reason = '读取失败：' + e.message; }
-          }
-          (reason ? cleanupSkipped : cleanupRows).value.push({ ...tree, reason });
-        }
-      });
-    }
-    function checkCleanup(tree) {
-      if (serviceBusy.value || busy.value || batchRunning.value || resolving.value) return;
-      cleanupDialog.value.close();
-      return previewRelease(tree);
-    }
     function closeBulkCleanup() {
       if (busy.value) return;
       bulkCleanupPreview.value = null; bulkCleanupDialog.value?.close();
@@ -1197,18 +1314,27 @@ createApp({
       if (refs.length > 30) { bulkCleanupIssue.value = '每批最多 30 项，请缩小搜索范围或手动勾选。'; return; }
       bulkCleanupSelected.value = refs;
     }
-    function openBulkCleanup(mode, selectedRefs = []) {
-      if (navigationLocked.value || !['release', 'delete'].includes(mode)) return;
+    function openBulkCleanup(mode, selectedRefs = [], discardIgnored = false) {
+      if (navigationLocked.value || !['release', 'delete', 'merged'].includes(mode)) return;
       if (plan.value || commitPreview.value || pushPreview.value || resolutionPreview.value) {
         showError('请先完成或关闭当前 Git 预览，再打开批量清理。'); return;
       }
       bulkCleanupMode.value = mode; bulkCleanupRows.value = []; bulkCleanupSelected.value = []; bulkCleanupSearch.value = '';
+      bulkCleanupDiscardIgnored.value = discardIgnored; bulkCleanupBase.value = null;
       resetBulkCleanupPreview(); bulkCleanupRoot = overview.value.root;
       if (!bulkCleanupDialog.value.open) bulkCleanupDialog.value.showModal();
       return run('读取批量清理列表', async () => {
         try {
-          const latest = await api('overview');
+          const latest = await api(mode === 'merged' ? 'branch/merged/list' : 'overview',
+            mode === 'merged' ? { discard_ignored: discardIgnored } : {});
           if (!bulkCleanupRoot || latest.root !== bulkCleanupRoot) throw new Error('仓库已变化，请关闭后重新打开。');
+          if (mode === 'merged') {
+            if (!Array.isArray(latest.rows) || !latest.base || latest.base_ref !== 'refs/remotes/origin/master') throw new Error('合并检查列表不完整，请重启工作台后台后重新读取。');
+            bulkCleanupBase.value = { ref: latest.base_ref, head: latest.base };
+            bulkCleanupRows.value = latest.rows.map(row => ({ ...row,
+              reason: row.reason || (row.path && row.path === path.value ? '当前审查工作区，请切换至其他工作区后再清理' : '') }));
+            return;
+          }
           bulkCleanupRows.value = (latest.branches || []).filter(tree => tree.ref?.startsWith('refs/heads/')).map(tree => {
             const occupied = latest.worktrees.filter(item => item.branch === tree.branch);
             const reason = !tree.branch || tree.branch === 'master' ? '受保护分支或分离 HEAD' :
@@ -1220,7 +1346,10 @@ createApp({
             return { ...tree, reason };
           });
           bulkCleanupSelected.value = bulkCleanupRows.value.filter(row => !row.reason && selectedRefs.includes(row.ref)).map(row => row.ref);
-        } catch (e) { bulkCleanupIssue.value = e.message; }
+        } catch (e) {
+          bulkCleanupIssue.value = mode === 'merged' && /接口不存在|404/.test(e.message) ?
+            '当前后台尚未支持已合并分支清理，请重启 Branch Desk 后台并重新连接工作台，再重新检查。' : e.message;
+        }
       });
     }
     function previewBulkCleanup() {
@@ -1235,32 +1364,59 @@ createApp({
         bulkCleanupIssue.value = '选择包含不可用项目或仓库已变化，请重新打开并选择。'; return;
       }
       return run('预览' + bulkCleanupTitle.value, async () => {
+        let links = {};
+        if (feishuEnabled.value) {
+          try {
+            bulkCleanupLinkSpace = taskLinkSpace();
+            const snapshot = await readUnlinkSnapshot(bulkCleanupRoot, bulkCleanupLinkSpace);
+            links = snapshot.links;
+          } catch (e) { bulkCleanupLinksIssue.value = '需求关联读取失败：' + e.message; }
+        }
         const reviewed = [];
         for (const row of rows) {
           if (navigationStopped || overview.value.root !== bulkCleanupRoot) { bulkCleanupIssue.value = '仓库或页面已变化，请重新预览。'; return; }
           let preview = null, issue = '';
           try {
-            preview = await api(mode === 'release' ? 'worktree/release/preview' : 'branch/delete/preview',
-              mode === 'release' ? { path: row.path, force: false } : { ref: row.ref, force: false });
-            if (!preview.plan || !preview.head || preview.force !== false || preview.branch !== row.branch ||
-                (mode === 'release' ? preview.path !== row.path : preview.ref !== row.ref || preview.root_path !== bulkCleanupRoot)) {
+            const route = mode === 'merged' ? 'branch/merged/preview' : mode === 'release' ? 'worktree/release/preview' : 'branch/delete/preview';
+            const data = mode === 'merged' ? { ref: row.ref, discard_ignored: bulkCleanupDiscardIgnored.value } :
+              mode === 'release' ? { path: row.path, force: false } : { ref: row.ref, force: false };
+            preview = await api(route, data);
+            const expectedForce = mode === 'merged' && bulkCleanupDiscardIgnored.value;
+            if (!preview.plan || !preview.head || preview.force !== expectedForce || preview.branch !== row.branch ||
+                (mode === 'release' ? preview.path !== row.path : preview.ref !== row.ref || preview.root_path !== bulkCleanupRoot) ||
+                (mode === 'merged' && (preview.base !== bulkCleanupBase.value?.head || preview.base_ref !== bulkCleanupBase.value?.ref || preview.path !== (row.path || '')))) {
               throw new Error('预览对象与所选项目不一致，请重新检查。');
             }
           } catch (e) { issue = e.message; preview = null; }
-          reviewed.push({ ref: row.ref, branch: row.branch, path: row.path, preview, error: issue });
+          const linkedTasks = Object.entries(links).filter(([, link]) => link.branch_ref === row.ref).map(([id, link]) => ({
+            work_item_id: id, title: taskLinkTitle(id), expected_ref: link.branch_ref
+          }));
+          reviewed.push({ ref: row.ref, branch: row.branch, path: row.path, preview, error: issue, links: linkedTasks });
         }
         if (navigationStopped || mode !== bulkCleanupMode.value || JSON.stringify(refs) !== JSON.stringify(bulkCleanupSelected.value)) return;
         bulkCleanupPreview.value = reviewed;
         if (reviewed.some(row => row.error)) bulkCleanupIssue.value = '有项目未通过检查；本批不会执行。请返回选择，移除受阻项目后重新预览。';
       });
     }
-    function executeBulkCleanup() {
+    async function executeBulkCleanup() {
       if (navigationLocked.value || !bulkCleanupReady.value) return;
       const reviewed = bulkCleanupPreview.value, mode = bulkCleanupMode.value;
+      const unlink = bulkCleanupUnlink.value, space = bulkCleanupLinkSpace;
+      if (unlink && (bulkCleanupLinksIssue.value || space !== taskLinkSpace() || reviewed.some(row => row.links.length > 100))) {
+        bulkCleanupIssue.value = '关联读取受阻、空间已变化或单个分支关联超过 100 项，请重新预览。'; return;
+      }
       if (overview.value.root !== bulkCleanupRoot || JSON.stringify(reviewed.map(row => row.ref)) !== JSON.stringify(bulkCleanupSelected.value)) {
         resetBulkCleanupPreview(); bulkCleanupIssue.value = '仓库或选择已变化，请重新预览。'; return;
       }
-      return run(bulkCleanupTitle.value, async () => {
+      const discarded = mode === 'merged' ? reviewed.filter(row => row.preview.ignored?.length) : [];
+      if (discarded.length) {
+        const files = discarded.map(row => `${row.branch}\n移除目录：${row.preview.path}\n` +
+          row.preview.ignored.map(item => `${item.path} · ${item.kind} · ${item.count} 项`).join('\n')).join('\n\n');
+        if (!await confirmAction({ title: '确认删除忽略文件并清理已合并分支', confirmLabel: '确认删除本地文件和分支', danger: true,
+          message: files + '\n\n以上忽略文件随 worktree 永久删除，不自动备份；符号链接只删除链接。远端分支保留。' })) return;
+        if (navigationStopped || navigationLocked.value || bulkCleanupPreview.value !== reviewed || overview.value.root !== bulkCleanupRoot) return;
+      }
+      await run(bulkCleanupTitle.value, async () => {
         bulkCleanupPreview.value = null; bulkCleanupIssue.value = '';
         bulkCleanupResults.value = reviewed.map(row => ({ ref: row.ref, branch: row.branch, path: row.path, status: 'pending', error: '' }));
         for (const [index, row] of reviewed.entries()) {
@@ -1268,6 +1424,13 @@ createApp({
           item.status = 'running';
           try {
             if (navigationStopped || overview.value.root !== bulkCleanupRoot) throw new Error('仓库或页面已变化，已停止后续项。');
+            if (unlink && row.links.length) {
+              const current = await api('task-links');
+              if (current.warning || space !== taskLinkSpace() || row.links.some(link =>
+                  current.items[link.work_item_id]?.branch_ref !== link.expected_ref)) {
+                throw new Error('待解除的需求关联已变化或读取受阻，请重新预览。');
+              }
+            }
             let checked = row.preview;
             if (mode === 'delete') {
               // Deleting an earlier branch changes tracking config, so renew its one-use preview.
@@ -1277,11 +1440,32 @@ createApp({
                 throw new Error('分支、提交或检查基准已变化，请重新预览。');
               }
             }
-            const value = await api(mode === 'release' ? 'worktree/release' : 'branch/delete', { plan: checked.plan, confirmation: true });
+            const route = mode === 'merged' ? 'branch/merged/delete' : mode === 'release' ? 'worktree/release' : 'branch/delete';
+            const value = await api(route, { plan: checked.plan, confirmation: true,
+              ...(mode === 'merged' ? { discard_confirmation: discarded.length > 0 } : {}) });
+            if (mode === 'merged') {
+              item.released = value.released === true;
+              if (value.status !== 'succeeded' || value.deleted !== true) throw new Error(value.error || '清理结果未确认，请刷新核对。');
+            }
             if (value.branch !== row.branch || (mode === 'release' && (value.path !== checked.path || value.head !== checked.head))) {
               throw new Error('执行结果与预览不一致，请刷新核对。');
             }
             item.status = 'succeeded';
+            if (unlink && row.links.length) {
+              try {
+                const linksResult = await api('task-links/unbind', { space_id: space, confirmed: true, missing_only: false,
+                  items: row.links.map(link => ({ work_item_id: link.work_item_id, expected_ref: link.expected_ref })) });
+                if (linksResult.warning || linksResult.results?.length !== row.links.length ||
+                    linksResult.results.some((result, index) => result.work_item_id !== row.links[index].work_item_id || result.status !== 'succeeded')) {
+                  throw new Error(linksResult.warning || '部分需求关联未解除，请在排期核对关联。');
+                }
+                item.unlinked = row.links.length;
+                quickLinks.value = linksResult.items;
+              } catch (e) {
+                item.linkError = '本地清理已完成，需求关联待核对：' + e.message;
+                bulkCleanupIssue.value += (bulkCleanupIssue.value ? '\n' : '') + item.linkError;
+              }
+            }
           } catch (e) {
             item.status = 'failed'; item.error = e.message;
             bulkCleanupIssue.value = '已停止后续项，保留已完成结果。失败项可能已产生效果，请刷新核对后重新选择；不会自动重试或回滚。';
@@ -1291,8 +1475,10 @@ createApp({
         plan.value = null;
         try { await loadOverview(); }
         catch (e) { bulkCleanupIssue.value += (bulkCleanupIssue.value ? '\n' : '') + '刷新列表失败：' + e.message + '。执行结果已保留。'; }
+        if (unlink) await schedulePanel.value?.readLinks?.();
         if (!bulkCleanupIssue.value) showMessage(`${bulkCleanupTitle.value}完成，共 ${reviewed.length} 项。`);
       });
+      if (unlink) await scanAttention();
     }
     async function copyReleaseInfo(kind) {
       if (!releaseTarget.value) return;
@@ -1366,12 +1552,18 @@ createApp({
       else showError(value.summary);
     }
     function fetchRemote() {
-      return run('刷新 origin 远端引用', async () => {
+      if (navigationLocked.value) return;
+      return run('刷新远端与列表', async () => {
         plan.value = null;
-        try { await api('fetch'); }
-        finally { await loadOverview(); }
-        fetchedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-        showMessage('origin 远端引用已刷新，请重新预览后合并。');
+        const issues = [];
+        try {
+          await api('fetch');
+          fetchedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        } catch (e) { issues.push('刷新远端失败：' + e.message); }
+        try { await loadOverview(); }
+        catch (e) { issues.push('刷新列表失败：' + e.message); }
+        if (issues.length) throw new Error(issues.join('\n'));
+        showMessage('远端引用和列表已刷新。');
       });
     }
     function openBranchConversation(tree) {
@@ -1693,11 +1885,13 @@ createApp({
       ++quickVersion; ++attentionVersion; quickBusy.value = false; attentionBusy.value = false;
       quickOverview.value = null; quickLinks.value = {}; quickJobs.value = {}; scheduleTasks.value = [];
       attentionItems.value = []; attentionChecked.value = ''; attentionError.value = ''; attentionStale.value = true;
+      resetUnlinkPreview(); unlinkRows.value = []; unlinkSelected.value = []; unlinkDialog.value?.close();
       mergePane.value = 'overview'; expandedBranch.value = ''; overviewScroll = 0; overviewWindowScroll = 0; overviewModuleScroll = 0; reviewOrigin = '';
     });
     watch(() => projectSettings.value.feishu?.space_id, () => {
       ++quickVersion; ++attentionVersion; quickLinks.value = {}; quickJobs.value = {}; scheduleTasks.value = [];
       attentionItems.value = []; attentionChecked.value = ''; attentionStale.value = true;
+      resetUnlinkPreview(); unlinkRows.value = []; unlinkSelected.value = []; unlinkDialog.value?.close();
     });
     watch(feishuEnabled, enabled => { if (!enabled && view.value === 'schedule') view.value = 'merge'; });
     watch(() => JSON.stringify([overview.value.root, (overview.value.worktrees || []).map(tree => [tree.path, tree.branch, tree.missing])]), () => {
@@ -1745,13 +1939,16 @@ createApp({
       mergePane, expandedBranch, overviewPane, branchSort, branchFilters, orderedBranchGroups, branchDetailsId, branchWorkspace,
       toggleBranchDetails, closeBranchDetails, enterReview, returnToOverview, positionToolbarMenu,
       historySearch, historyType, historyOnlyIssues, filteredHistoryItems, resetHistoryFilters,
-      busySeconds, lastAction, mergeReason, commitReason, pushReason, primaryMergeAction, cleanupDialog, cleanupRows, cleanupSkipped, cleanupProgress, scanCleanup, checkCleanup,
-      bulkCleanupDialog, bulkCleanupMode, bulkCleanupRows, bulkCleanupSelected, bulkCleanupSearch, bulkCleanupPreview, bulkCleanupResults, bulkCleanupIssue,
+      busySeconds, lastAction, mergeReason, commitReason, pushReason, primaryMergeAction,
+      bulkCleanupDialog, bulkCleanupMode, bulkCleanupRows, bulkCleanupSelected, bulkCleanupSearch, bulkCleanupPreview, bulkCleanupResults, bulkCleanupIssue, bulkCleanupDiscardIgnored, bulkCleanupBase,
       bulkCleanupTitle, bulkCleanupVisible, bulkCleanupEligible, bulkCleanupReady, bulkCleanupStatus, openBulkCleanup, closeBulkCleanup, selectAllBulkCleanup, previewBulkCleanup, executeBulkCleanup, resetBulkCleanupPreview,
+      bulkCleanupUnlink, bulkCleanupLinks, bulkCleanupLinksIssue,
       scheduleTasks, scheduleFocus, scheduleLocked, navigationLocked, quickDialog, quickInput, quickSearch, quickMode, quickActive, quickBusy, quickError, quickItems, visibleQuickItems,
       attentionItems, attentionBusy, attentionError, attentionProgress, attentionChecked, attentionStale, openQuick, closeQuick, quickClosed, refreshQuick, scanAttention, chooseQuick, quickKeydown, quickShortcut, focusSchedule, navigateBranch,
+      unlinkDialog, unlinkRows, unlinkSelected, unlinkSearch, unlinkVisible, unlinkPreview, unlinkResults, unlinkIssue, unlinkStatus,
+      openUnlink, closeUnlink, selectVisibleUnlinks, previewUnlink, executeUnlink, resetUnlinkPreview,
       filteredTrees, branchGroups, treeFilter, preferences, preferencesSaving, preferencesLoaded, isPinned, treeKey, branchName, branchNumber, branchSyncTag, pinBranch, copyPath,
       workspaceStatus, nextStep, fetchedAt, pushedHere, sourceName, sourceGroups, openSource, closeSource, filterSource, chooseSource, sourceKeydown,
-      resultTitle, resultDescription, refresh, batchFinished, fetchRemote, openBranchConversation, canUpdateBranch, updateBranch, selectTree, selectTarget, refreshStatus, preview, merge, previewCommit, commitMerge, previewPush, pushBranch };
+      resultTitle, resultDescription, refresh, batchFinished, fetchRemote, restartWorkbench, openBranchConversation, canUpdateBranch, updateBranch, selectTree, selectTarget, refreshStatus, preview, merge, previewCommit, commitMerge, previewPush, pushBranch };
   }
 }).mount('#app');

@@ -76,6 +76,10 @@ class OperationHistory:
                                '(repository, space_id, task_id, branch_ref, thread_url, previous_url, status) '
                                'SELECT repository, ' + legacy_space + ', task_id, branch_ref, thread_url, previous_url, status FROM task_links_legacy')
                     db.execute('DROP TABLE task_links_legacy')
+                columns = {row[1] for row in db.execute('PRAGMA table_info(task_links)')}
+                for name, definition in (('unlinked_ref', "TEXT NOT NULL DEFAULT ''"), ('unlinked_at', 'REAL')):
+                    if name not in columns:
+                        db.execute('ALTER TABLE task_links ADD COLUMN ' + name + ' ' + definition)
                 db.execute("UPDATE operations SET status='interrupted', finished=? "
                            "WHERE repository=? AND status='running'", (time.time(), self.repository))
                 db.execute("UPDATE operations SET resolution_status='interrupted' "
@@ -143,7 +147,8 @@ class OperationHistory:
             with self.lock, self.connect() as db:
                 db.row_factory = sqlite3.Row
                 return {row['task_id']: dict(row) for row in db.execute(
-                    'SELECT task_id, branch_ref, thread_url, previous_url, status FROM task_links WHERE repository=? AND space_id=?',
+                    'SELECT task_id, branch_ref, thread_url, previous_url, status, unlinked_ref, unlinked_at '
+                    'FROM task_links WHERE repository=? AND space_id=?',
                     (self.repository, space_id))}
         except (OSError, sqlite3.Error):
             self.unavailable()
@@ -162,6 +167,10 @@ class OperationHistory:
                 db.execute('INSERT INTO task_links (repository, space_id, task_id, branch_ref) VALUES (?, ?, ?, ?) '
                            'ON CONFLICT(repository, space_id, task_id) DO UPDATE SET branch_ref=excluded.branch_ref',
                            (self.repository, space_id, task_id, branch_ref))
+                if expected and not branch_ref:
+                    db.execute('UPDATE task_links SET unlinked_ref=?, unlinked_at=? '
+                               'WHERE repository=? AND space_id=? AND task_id=?',
+                               (expected, time.time(), self.repository, space_id, task_id))
         except (OSError, sqlite3.Error):
             self.unavailable()
             raise ValueError(self.warning) from None

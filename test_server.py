@@ -748,6 +748,58 @@ class BrowserChecks(unittest.TestCase):
             server.serve_forever.assert_called_once()
             server.server_close.assert_called_once()
 
+    def test_hot_restart_releases_socket_and_runtime_before_reloading_same_port_and_session(self):
+        for kind, failure in [('frontend', None), ('backend', OSError('fixture exec failure'))]:
+            with self.subTest(kind=kind), \
+                 patch('sys.argv', ['server.py', '--repo', '/fixture', '--no-browser']), \
+                 patch.dict(os.environ, {'BRANCH_DESK_RESTART_TOKEN': 't' * 43}), \
+                 patch('server.Repository') as repository_factory, patch('server.RuntimeSession') as runtime_factory, \
+                 patch('server.ProjectRegistry'), patch('server.history_file'), patch('server.OperationHistory'), \
+                 patch('server.service_options', return_value={'preset': 'bibase', 'kind': kind}), \
+                 patch('server.WorktreeServices') as frontend_services, patch('server.BackendServices') as backend_services, \
+                 patch('server.FeishuProject'), patch('server.DevelopmentLauncher'), \
+                 patch('server.HTTPServer') as server_factory, patch('server.os.execve') as replace_process, patch('server.print'):
+                repository_factory.return_value.root = '/fixture'
+                server = server_factory.return_value
+                server.server_port = 8123
+                closed = []
+                server.server_close.side_effect = lambda: closed.append('socket')
+                runtime_factory.return_value.__exit__.side_effect = lambda *_: closed.append('runtime')
+
+                def request_restart():
+                    server.restart_requested = True
+
+                def replace(executable, command, environment):
+                    self.assertEqual(closed, ['socket', 'runtime'])
+                    self.assertEqual(command, [executable, '-X', 'utf8', str(Path(__file__).with_name('server.py').resolve()),
+                                               '--repo', '/fixture', '--port', '8123', '--no-browser'])
+                    self.assertEqual(environment['BRANCH_DESK_RESTART_TOKEN'], 't' * 43)
+                    if failure:
+                        raise failure
+
+                server.serve_forever.side_effect = request_restart
+                replace_process.side_effect = replace
+                if failure:
+                    with self.assertRaisesRegex(Exception, '重启启动失败'):
+                        main()
+                else:
+                    main()
+                replace_process.assert_called_once()
+                self.assertEqual(server.token, 't' * 43)
+                self.assertNotIn('BRANCH_DESK_RESTART_TOKEN', os.environ)
+                for factory in (frontend_services, backend_services):
+                    factory.return_value.stop.assert_not_called()
+                    factory.return_value.close.assert_not_called()
+
+    def test_invalid_restart_session_stops_before_repository_or_server_initialization(self):
+        with patch('sys.argv', ['server.py', '--repo', '/fixture']), \
+             patch.dict(os.environ, {'BRANCH_DESK_RESTART_TOKEN': 'invalid'}), \
+             patch('server.Repository') as repository_factory, patch('server.HTTPServer') as server_factory:
+            with self.assertRaisesRegex(Exception, '重启会话无效'):
+                main()
+            repository_factory.assert_not_called()
+            server_factory.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

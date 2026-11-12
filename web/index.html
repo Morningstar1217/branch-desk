@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="branch-desk-build" content="2026.11.09.1"><title>Branch Desk</title><link rel="icon" type="image/svg+xml" sizes="any" href="/favicon.svg"><link rel="stylesheet" href="/style.css"><script defer src="/vendor/vue.global.prod.js"></script><script defer src="/schedule.js"></script><script defer src="/batch.js"></script><script defer src="/app.js"></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="branch-desk-build" content="2026.11.11.4"><title>Branch Desk</title><link rel="icon" type="image/svg+xml" sizes="any" href="/favicon.svg"><link rel="stylesheet" href="/style.css"><script defer src="/vendor/vue.global.prod.js"></script><script defer src="/schedule.js"></script><script defer src="/batch.js"></script><script defer src="/app.js"></script></head>
 <body><div id="app" v-cloak>
   <div ref="messageElement" popover="manual" class="worktree-message" :class="messageType==='error' ? 'danger' : 'success'" :role="messageType==='error' ? 'alert' : 'status'" aria-atomic="true">{{ message }}</div>
   <dialog ref="confirmationDialog" class="batch-dialog action-confirm-dialog" aria-labelledby="action-confirm-heading" aria-describedby="action-confirm-message" @cancel.prevent="finishConfirmation()" @close="!confirmationDialog.open && finishConfirmation()">
@@ -68,38 +68,114 @@
       </li>
     </ul>
     <p v-if="!quickBusy && !(quickMode==='attention' && attentionBusy) && !visibleQuickItems.length" class="hint" role="status">{{ quickSearch ? '没有匹配的结果，试试其他关键词。' : quickMode==='attention' ? (attentionError || attentionStale ? '尚未完成检查，请重试后查看结果。' : '本次检查没有发现这三类待处理事项。') : '暂无可用结果。' }}</p>
-    <div class="quick-footer"><span class="hint">↑↓ 选择 · Enter 打开 · Esc 关闭<span v-if="quickItems.length>60"> · 仅显示前 60 项，请缩小搜索范围</span></span><button v-if="quickMode==='attention'" @click="scanAttention" :disabled="attentionBusy || navigationLocked">重新检查</button><button v-else @click="refreshQuick" :disabled="quickBusy || navigationLocked">刷新结果</button></div>
+    <div class="quick-footer">
+      <span class="hint">↑↓ 选择 · Enter 打开 · Esc 关闭<span v-if="quickItems.length>60"> · 仅显示前 60 项，请缩小搜索范围</span></span>
+      <div class="quick-footer-actions">
+        <button v-if="quickMode==='attention' && feishuEnabled" @click="openUnlink()" :disabled="attentionBusy || navigationLocked">批量解除已交付关联…</button>
+        <button v-if="quickMode==='attention'" @click="scanAttention" :disabled="attentionBusy || navigationLocked">重新检查</button>
+        <button v-else @click="refreshQuick" :disabled="quickBusy || navigationLocked">刷新结果</button>
+      </div>
+    </div>
   </dialog>
-  <dialog ref="cleanupDialog" class="batch-dialog release-dialog" aria-labelledby="cleanup-heading" @cancel="busy && $event.preventDefault()">
-    <div class="preview-heading"><h2 id="cleanup-heading">工作区清理候选</h2><button autofocus @click="cleanupDialog.close()" :disabled="serviceBusy || busy">关闭</button></div>
-    <p class="hint">初筛排除当前、启动、常用、受保护及有本地改动的工作区。候选仍须逐个检查忽略文件和进程占用，再确认释放。</p>
-    <p v-if="busy" class="loading" role="status">{{ busyLabel }} · {{ cleanupProgress || '准备中' }} · 已用 {{ busySeconds }} 秒</p>
-    <p v-if="error" class="notice danger" role="alert">{{ error }}</p>
-    <p v-if="!busy" class="hint">{{ cleanupRows.length }} 个初步候选 · {{ cleanupSkipped.length }} 个已排除；结果可能随外部操作变化。</p>
-    <ul class="cleanup-list"><li v-for="tree in cleanupRows" :key="tree.path"><span><strong>{{ tree.branch }}</strong><small class="hint wrap">{{ tree.path }}</small></span><button @click="checkCleanup(tree)" :disabled="serviceBusy || busy || batchRunning || resolving">检查释放条件</button></li></ul>
-    <details v-if="cleanupSkipped.length"><summary>查看排除原因</summary><ul class="cleanup-list"><li v-for="tree in cleanupSkipped" :key="tree.path"><span class="wrap">{{ tree.branch || '分离 HEAD' }}<small class="hint">{{ tree.reason }}</small></span></li></ul></details>
-    <button @click="scanCleanup" :disabled="serviceBusy || busy || batchRunning || resolving">重新初筛</button>
+  <dialog ref="unlinkDialog" class="batch-dialog release-dialog bulk-cleanup-dialog" aria-labelledby="unlink-heading" @cancel.prevent="closeUnlink">
+    <div class="preview-heading">
+      <h2 id="unlink-heading">批量解除已交付需求关联</h2>
+      <button type="button" autofocus @click="closeUnlink" :disabled="busy">关闭</button>
+    </div>
+    <p class="hint">选择已上线且本地分支已删除的需求，解除本机关联。开发会话与操作历史保留，处理后记录原分支和时间。</p>
+    <p v-if="busy" class="loading" role="status">{{ busyLabel }} · 已用 {{ busySeconds }} 秒</p>
+    <p v-if="unlinkIssue" class="notice warning" role="alert">{{ unlinkIssue }}</p>
+    <template v-if="!unlinkPreview && !unlinkResults.length">
+      <label for="unlink-search">搜索需求或原关联分支</label>
+      <input id="unlink-search" type="search" v-model="unlinkSearch" placeholder="输入名称、编号或分支…" :disabled="busy">
+      <div class="bulk-cleanup-tools">
+        <span class="hint" role="status">已选 {{ unlinkSelected.length }} / 100 项 · 当前 {{ unlinkVisible.length }} 项</span>
+        <button type="button" @click="selectVisibleUnlinks" :disabled="navigationLocked || !unlinkVisible.length">仅选当前结果</button>
+        <button type="button" @click="unlinkSelected=[]" :disabled="navigationLocked || !unlinkSelected.length">清空选择</button>
+      </div>
+      <ul class="cleanup-list bulk-cleanup-list" aria-label="本地分支已删除的需求关联">
+        <li v-for="row in unlinkVisible" :key="row.work_item_id">
+          <label>
+            <input type="checkbox" :value="row.work_item_id" v-model="unlinkSelected"
+              :disabled="navigationLocked || (!unlinkSelected.includes(row.work_item_id) && unlinkSelected.length>=100)">
+            <span>
+              <strong>{{ row.title }}</strong>
+              <small class="hint wrap">{{ row.work_item_id }} · {{ row.expected_ref.replace('refs/heads/','') }}</small>
+              <small class="hint">本地分支已删除</small>
+            </span>
+          </label>
+        </li>
+      </ul>
+      <p v-if="!busy && !unlinkVisible.length && !unlinkIssue" class="hint" role="status">没有匹配的已删除分支关联。</p>
+      <div class="page-actions">
+        <button type="button" @click="openUnlink(true)" :disabled="navigationLocked">重新读取</button>
+        <button type="button" class="primary" @click="previewUnlink" :disabled="navigationLocked || !unlinkSelected.length">预览所选 {{ unlinkSelected.length }} 项</button>
+      </div>
+    </template>
+    <template v-if="unlinkPreview">
+      <p class="notice warning">请确认以下 {{ unlinkPreview.rows.length }} 个需求均已交付，执行时逐项重新核对。关联变化或本地分支重新出现的项目会跳过。</p>
+      <ul class="cleanup-list bulk-cleanup-list" aria-label="待确认解除的需求关联">
+        <li v-for="row in unlinkPreview.rows" :key="row.work_item_id">
+          <span>
+            <strong>{{ row.title }}</strong>
+            <small class="hint wrap">{{ row.work_item_id }} · {{ row.expected_ref.replace('refs/heads/','') }}</small>
+          </span>
+        </li>
+      </ul>
+      <div class="page-actions">
+        <button type="button" @click="resetUnlinkPreview" :disabled="navigationLocked">返回选择</button>
+        <button type="button" class="primary" @click="executeUnlink" :disabled="navigationLocked">确认已交付并解除关联（{{ unlinkPreview.rows.length }}）</button>
+      </div>
+    </template>
+    <template v-if="unlinkResults.length">
+      <p class="hint" role="status">
+        已解除 {{ unlinkResults.filter(row=>row.status==='succeeded').length }} 项 ·
+        已跳过 {{ unlinkResults.filter(row=>row.status==='skipped').length }} 项 ·
+        失败或待核对 {{ unlinkResults.filter(row=>['failed','unconfirmed'].includes(row.status)).length }} 项
+      </p>
+      <ul class="cleanup-list bulk-cleanup-list" aria-label="批量解除关联结果" aria-live="polite">
+        <li v-for="row in unlinkResults" :key="row.work_item_id">
+          <span>
+            <strong>{{ row.title }}</strong>
+            <small class="hint wrap">{{ row.work_item_id }} · {{ row.expected_ref.replace('refs/heads/','') }}</small>
+            <small v-if="row.error" class="bulk-cleanup-issue">{{ row.error }}</small>
+            <small v-if="row.unlinked_at" class="hint">{{ historyTime({started:row.unlinked_at}) }}</small>
+          </span>
+          <span class="badge">{{ unlinkStatus(row.status) }}</span>
+        </li>
+      </ul>
+      <div class="page-actions">
+        <button type="button" @click="openUnlink(true)" :disabled="navigationLocked">重新读取并选择</button>
+      </div>
+    </template>
   </dialog>
   <dialog ref="bulkCleanupDialog" class="batch-dialog release-dialog bulk-cleanup-dialog" aria-labelledby="bulk-cleanup-heading" @cancel.prevent="closeBulkCleanup">
     <div class="preview-heading"><h2 id="bulk-cleanup-heading">{{ bulkCleanupTitle }}</h2><button type="button" autofocus @click="closeBulkCleanup" :disabled="busy">关闭</button></div>
-    <p class="hint">{{ bulkCleanupMode==='release' ? '只移除工作区目录，保留本地分支、提交及远端。需要保留的忽略文件、未提交改动或进程占用会阻止释放。' : '只删除本地分支，不删除远端。分支仍被 worktree 占用时，请先释放；检查基准以每项预览为准。' }}本批只使用普通安全模式，不强制删除，不自动停止服务。</p>
+    <p v-if="bulkCleanupMode==='merged'" class="hint">仅清理全部提交已合入 origin/master 的本地分支，同时释放对应 worktree。保留 Sentry、master/main/pre/test、常用及启动目录分支；未提交改动、异常上游和进程占用会阻止清理。远端分支保留，不自动停止服务。</p>
+    <p v-else class="hint">{{ bulkCleanupMode==='release' ? '只移除工作区目录，保留本地分支、提交及远端。需要保留的忽略文件、未提交改动或进程占用会阻止释放。' : '只删除本地分支，不删除远端。分支仍被 worktree 占用时，请先释放；检查基准以每项预览为准。' }}本批只使用普通安全模式，不强制删除，不自动停止服务。</p>
+    <p v-if="bulkCleanupMode==='merged' && bulkCleanupBase" class="hint wrap">合并基准：origin/master · {{ bulkCleanupBase.head }}。使用本地缓存，不自动联网；需要最新状态时，先关闭弹窗并点击右上角“刷新”。</p>
     <p v-if="busy" class="loading" role="status">{{ busyLabel }} · 已用 {{ busySeconds }} 秒，请保持页面打开。</p>
     <p v-if="bulkCleanupIssue" class="notice danger bulk-cleanup-issue" role="alert">{{ bulkCleanupIssue }}</p>
     <template v-if="!bulkCleanupPreview && !bulkCleanupResults.length">
+      <label v-if="bulkCleanupMode==='merged'"><input type="checkbox" v-model="bulkCleanupDiscardIgnored" @change="openBulkCleanup('merged', [], bulkCleanupDiscardIgnored)" :disabled="navigationLocked"> 允许清理 worktree 中的忽略文件（如 node_modules）；预览清单后须二次确认，不自动备份。</label>
       <label class="sr-only" for="bulk-cleanup-search">搜索本地分支或目录</label><input id="bulk-cleanup-search" type="search" v-model="bulkCleanupSearch" placeholder="搜索分支、编号或目录…" :disabled="busy">
       <div class="bulk-cleanup-tools"><span class="hint" role="status">已选 {{ bulkCleanupSelected.length }} / 30 项 · 当前 {{ bulkCleanupEligible.length }} 项可检查</span><button type="button" @click="selectAllBulkCleanup" :disabled="navigationLocked || !bulkCleanupEligible.length">仅选当前结果</button><button type="button" @click="bulkCleanupSelected=[]" :disabled="navigationLocked || !bulkCleanupSelected.length">清空选择</button></div>
       <ul class="cleanup-list bulk-cleanup-list" aria-label="待清理的本地分支"><li v-for="row in bulkCleanupVisible" :key="row.ref"><label><input type="checkbox" :value="row.ref" v-model="bulkCleanupSelected" :disabled="navigationLocked || !!row.reason || (!bulkCleanupSelected.includes(row.ref) && bulkCleanupSelected.length>=30)"><span><strong>{{ row.branch }}</strong><small v-if="row.path" class="hint wrap">{{ row.path }}</small><small v-if="row.reason" class="hint">{{ row.reason }}</small></span></label></li></ul>
       <p v-if="!busy && !bulkCleanupVisible.length" class="hint">没有匹配的本地分支。</p>
+      <p v-if="bulkCleanupMode==='merged' && !busy && bulkCleanupRows.length && !bulkCleanupRows.some(row=>!row.reason)" class="hint" role="status">当前没有可安全清理的已合并分支；保留原因见列表。</p>
       <div class="page-actions"><button type="button" class="primary" @click="previewBulkCleanup" :disabled="navigationLocked || !bulkCleanupSelected.length || bulkCleanupSelected.length>30">预览所选 {{ bulkCleanupSelected.length }} 项</button></div>
     </template>
     <template v-if="bulkCleanupPreview">
       <p class="hint">请核对以下 {{ bulkCleanupPreview.length }} 项；确认后按顺序执行，每项重新校验。失败立即停止，不自动重试或回滚。执行期间请勿使用其他工具修改这些分支或工作区。</p>
-      <ul class="cleanup-list bulk-cleanup-list"><li v-for="row in bulkCleanupPreview" :key="row.ref"><span><strong>{{ row.branch }}</strong><small v-if="row.error" class="bulk-cleanup-issue">未通过：{{ row.error }}</small><template v-else><small class="hint wrap">提交：{{ row.preview.head }}</small><small v-if="bulkCleanupMode==='release'" class="hint wrap">移除目录：{{ row.preview.path }}</small><small v-else class="hint wrap">检查基准：{{ row.preview.base_ref }} · {{ row.preview.base }}</small><small v-if="row.preview.generated?.length" class="hint wrap">同时移除可重建的运行文件：{{ row.preview.generated.join('、') }}</small></template></span><span class="badge">{{ row.error ? '受阻' : '已通过检查' }}</span></li></ul>
-      <div class="page-actions"><button type="button" @click="resetBulkCleanupPreview" :disabled="navigationLocked">返回选择</button><button type="button" class="danger-button" @click="executeBulkCleanup" :disabled="navigationLocked || !bulkCleanupReady">{{ bulkCleanupMode==='release' ? '确认批量释放' : '确认批量删除本地分支' }}（{{ bulkCleanupPreview.length }}）</button></div>
+      <p v-if="bulkCleanupLinksIssue" class="notice warning" role="status">{{ bulkCleanupLinksIssue }}。同步解除选项暂不可用，可重新预览后读取。</p>
+      <label v-if="bulkCleanupLinks.length"><input type="checkbox" v-model="bulkCleanupUnlink" :disabled="navigationLocked || !!bulkCleanupLinksIssue"> 同时解除这些分支对应的 {{ bulkCleanupLinks.length }} 个需求关联（请确认相关需求已交付）</label>
+      <ul v-if="bulkCleanupLinks.length" class="cleanup-list bulk-cleanup-list" aria-label="可同步解除的需求关联"><li v-for="link in bulkCleanupLinks" :key="link.work_item_id"><span><strong>{{ link.title }}</strong><small class="hint wrap">{{ link.work_item_id }} · {{ link.expected_ref.replace('refs/heads/','') }}</small></span></li></ul>
+      <ul class="cleanup-list bulk-cleanup-list"><li v-for="row in bulkCleanupPreview" :key="row.ref"><span><strong>{{ row.branch }}</strong><small v-if="row.error" class="bulk-cleanup-issue">未通过：{{ row.error }}</small><template v-else><small class="hint wrap">提交：{{ row.preview.head }}</small><small v-if="row.preview.path" class="hint wrap">移除目录：{{ row.preview.path }}</small><small v-if="bulkCleanupMode!=='release'" class="hint wrap">检查基准：{{ row.preview.base_ref }} · {{ row.preview.base }}</small><small v-if="row.preview.generated?.length" class="hint wrap">同时移除可重建的运行文件：{{ row.preview.generated.join('、') }}</small><small v-for="item in row.preview.ignored || []" :key="item.path" class="bulk-cleanup-issue wrap">将删除：{{ item.path }} · {{ item.kind }} · {{ item.count }} 项</small></template></span><span class="badge">{{ row.error ? '受阻' : '已通过检查' }}</span></li></ul>
+      <div class="page-actions"><button type="button" @click="resetBulkCleanupPreview" :disabled="navigationLocked">返回选择</button><button type="button" class="danger-button" @click="executeBulkCleanup" :disabled="navigationLocked || !bulkCleanupReady">{{ bulkCleanupMode==='merged' ? '确认释放并删除本地分支' : bulkCleanupMode==='release' ? '确认批量释放' : '确认批量删除本地分支' }}（{{ bulkCleanupPreview.length }}）</button></div>
     </template>
     <template v-if="bulkCleanupResults.length">
-      <ul class="cleanup-list bulk-cleanup-list" aria-label="批量清理结果" aria-live="polite"><li v-for="row in bulkCleanupResults" :key="row.ref"><span><strong>{{ row.branch }}</strong><small v-if="row.error" class="bulk-cleanup-issue">{{ row.error }}</small><small v-if="row.status==='pending' && !busy" class="hint">前项受阻，本项未执行。</small></span><span class="badge" :class="{'bulk-cleanup-issue':row.status==='failed'}">{{ bulkCleanupStatus(row.status) }}</span></li></ul>
-      <div class="page-actions"><button type="button" @click="openBulkCleanup(bulkCleanupMode)" :disabled="navigationLocked">重新读取并选择</button><button v-if="bulkCleanupMode==='release' && bulkCleanupResults.some(row=>row.status==='succeeded')" type="button" @click="openBulkCleanup('delete',bulkCleanupResults.filter(row=>row.status==='succeeded').map(row=>row.ref))" :disabled="navigationLocked">继续删除已释放的本地分支…</button></div>
+      <ul class="cleanup-list bulk-cleanup-list" aria-label="批量清理结果" aria-live="polite"><li v-for="row in bulkCleanupResults" :key="row.ref"><span><strong>{{ row.branch }}</strong><small v-if="row.error" class="bulk-cleanup-issue">{{ row.error }}</small><small v-if="row.linkError" class="bulk-cleanup-issue">{{ row.linkError }}</small><small v-if="row.unlinked" class="hint">已同步解除 {{ row.unlinked }} 个需求关联</small><small v-if="row.status==='failed' && row.released" class="hint">worktree 已释放，本地分支保留；请刷新核对。</small><small v-if="row.status==='pending' && !busy" class="hint">前项受阻，本项未执行。</small></span><span class="badge" :class="{'bulk-cleanup-issue':row.status==='failed'}">{{ bulkCleanupStatus(row.status) }}</span></li></ul>
+      <div class="page-actions"><button type="button" @click="openBulkCleanup(bulkCleanupMode, [], bulkCleanupDiscardIgnored)" :disabled="navigationLocked">重新读取并选择</button><button v-if="bulkCleanupMode==='release' && bulkCleanupResults.some(row=>row.status==='succeeded')" type="button" @click="openBulkCleanup('delete',bulkCleanupResults.filter(row=>row.status==='succeeded').map(row=>row.ref))" :disabled="navigationLocked">继续删除已释放的本地分支…</button></div>
     </template>
   </dialog>
   <dialog ref="releaseDialog" class="batch-dialog release-dialog" aria-labelledby="release-heading" @cancel="busy && $event.preventDefault()">
@@ -220,6 +296,7 @@
     <main id="merge-workspace" v-show="view==='merge'">
       <div class="title-row branch-workspace-title"><div><div class="workspace-title-line"><h1>{{ mergePane==='overview' ? '分支总览' : '合并审查' }}</h1><span v-if="mergePane==='overview'" class="branch-count" role="status">{{ filteredTrees.length }} 个分支</span></div><p class="muted repo-path" :title="overview.root">{{ overview.root || '正在读取仓库…' }}</p></div><div class="page-actions" role="group" aria-label="代码合并操作">
         <batch-dialog ref="batchDialog" :show-message="showMessage" :api="api" :confirm-action="confirmAction" :overview="overview" :selected-path="path" :disabled="serviceBusy || busy || resolving" @locked="batchRunning=$event" @changed="batchFinished"></batch-dialog>
+        <button type="button" class="danger-button" @click="openBulkCleanup('merged')" :disabled="navigationLocked">删除已合并的分支</button>
         <button id="workspace-batch-menu-trigger" type="button" popovertarget="workspace-batch-menu" class="primary">批量操作<span v-if="batchDialog?.running" class="toolbar-running" role="status">执行中</span><svg class="dropdown-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
         <div id="workspace-batch-menu" popover="auto" class="source-menu workspace-action-popover" role="group" aria-label="批量操作" @beforetoggle="positionToolbarMenu" @click.capture="$event.target.closest('button:not(:disabled)') && $event.currentTarget.hidePopover()">
           <button type="button" @click="batchDialog.open('all-in')" :disabled="serviceBusy || busy || resolving || !batchDialog">批量合并</button>
@@ -231,8 +308,7 @@
         </div>
         <button id="workspace-more-menu-trigger" type="button" popovertarget="workspace-more-menu">更多操作<svg class="dropdown-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
         <div id="workspace-more-menu" popover="auto" class="source-menu workspace-action-popover" role="group" aria-label="更多操作" @beforetoggle="positionToolbarMenu" @click.capture="$event.target.closest('button:not(:disabled)') && $event.currentTarget.hidePopover()">
-          <button type="button" @click="scanCleanup" :disabled="serviceBusy || busy || batchRunning || resolving" title="只读初筛，释放前仍需逐个检查确认">清理候选</button>
-          <button type="button" @click="fetchRemote" :disabled="serviceBusy || busy || batchRunning || resolving" title="从 origin 获取最新引用，不修改工作区">刷新远端引用</button>
+          <button type="button" @click="restartWorkbench" :disabled="projectSwitchLocked" title="重载当前项目的工作台后台并自动重新连接">重启当前工作台</button>
           <template v-if="desktopWindowActions">
             <hr>
             <button type="button" @click="desktopWindowAction('home')" :disabled="navigationLocked">选择项目 / 重新连接</button>
@@ -240,7 +316,7 @@
             <button type="button" @click="desktopWindowAction('shutdown')" :disabled="navigationLocked">关闭空闲工作台后台…</button>
           </template>
         </div>
-        <button type="button" @click="refresh" :disabled="serviceBusy || busy || batchRunning">刷新列表</button>
+        <button type="button" @click="fetchRemote" :disabled="navigationLocked" title="从 origin 获取最新远端引用并刷新列表">刷新</button>
       </div></div>
       <div v-if="activeTask || busy || mergePane==='review' && lastAction || mergePane==='overview' && resultTitle" class="branch-workspace-feedback">
       <div v-if="activeTask" class="task-context"><span class="wrap">当前需求：<strong>{{ activeTask.title }}</strong> · {{ activeTask.work_item_id }}</span><div><a v-if="activeTask.url" :href="activeTask.url">打开开发会话 ↗</a><button @click="switchView('schedule')" :disabled="serviceBusy || busy">返回排期</button></div></div>

@@ -96,6 +96,59 @@ class WindowsPlatformChecks(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue())['projects'], [])
             launch.assert_not_called()
 
+    def test_restart_requires_current_identity_confirmation_and_idle_tasks(self):
+        handler = Handler.__new__(Handler)
+        handler.path = '/api/runtime/restart'
+        handler.headers_ok = Mock()
+        handler.reply = Mock()
+        server = SimpleNamespace(token='test-token', shutdown=Mock(), restart_requested=False,
+            runtime=SimpleNamespace(identity={'identity': 'current-instance'}),
+            repo=SimpleNamespace(batch=SimpleNamespace(guard=Mock()), resolver=SimpleNamespace(guard=Mock())),
+            development=SimpleNamespace(status=Mock(return_value={})))
+        handler.server = server
+        data = dict(confirmed=True, expected_identity='current-instance')
+
+        def request(payload, token='test-token'):
+            body = json.dumps(payload).encode()
+            handler.headers = {'X-Session-Token': token, 'Content-Type': 'application/json', 'Content-Length': str(len(body))}
+            handler.rfile = io.BytesIO(body)
+            handler.do_POST()
+
+        with patch('server.threading.Thread') as thread:
+            for payload in ({}, {**data, 'confirmed': False}, {**data, 'expected_identity': 'stale'}):
+                request(payload)
+                self.assertEqual(handler.reply.call_args.args[0], 400)
+            request(data, token='wrong')
+            self.assertEqual(handler.reply.call_args.args[0], 400)
+            for guard in (server.repo.batch.guard, server.repo.resolver.guard):
+                guard.side_effect = ValueError('active task')
+                request(data)
+                self.assertEqual(handler.reply.call_args.args[0], 400)
+                guard.side_effect = None
+            server.development.status.return_value = {'task': {'status': 'running'}}
+            request(data)
+            self.assertEqual(handler.reply.call_args.args[0], 400)
+            self.assertFalse(server.restart_requested)
+            thread.assert_not_called()
+            server.development.status.return_value = {}
+            request(data)
+            self.assertEqual(handler.reply.call_args.args, (200, {'status': 'restarting'}))
+            self.assertTrue(server.restart_requested)
+            thread.assert_called_once_with(target=server.shutdown, daemon=True)
+            request(data)
+            self.assertEqual(handler.reply.call_args.args[0], 400)
+            self.assertEqual(thread.call_count, 1)
+            server.restart_requested = False
+            thread.return_value.start.side_effect = RuntimeError('fixture thread failure')
+            request(data)
+            self.assertEqual(handler.reply.call_args.args[0], 400)
+            self.assertFalse(server.restart_requested)
+            thread.return_value.start.side_effect = None
+            handler.reply.side_effect = [BrokenPipeError('client disconnected'), None]
+            request(data)
+            self.assertTrue(server.restart_requested)
+            self.assertEqual(thread.return_value.start.call_count, 3)
+
     def test_shutdown_cli_requires_explicit_confirmation(self):
         with patch('sys.argv', ['bridge.py', 'shutdown']), patch('windows.bridge.shutdown_all') as shutdown, \
              patch('sys.stdout', new_callable=io.StringIO):
